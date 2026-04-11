@@ -1,13 +1,12 @@
 # Beschreibende Metadaten
 abstract: |
-  Abstract zum Skript.
+  OER für die Lehrveranstaltung in Köln ...
 abstract-title: "Zusammenfassung"
 description: |
   Kurzbeschreibung der Inhalte des Skripts.
 funding: |
   Optionale Angaben zur Förderung, in deren Rahmen das Skript erstellt wurde
 # vgl. https://quarto.org/docs/authoring/front-matter.html#funding
-
 # Open Graph Metadaten für HTML-Header: https://quarto.org/docs/websites/website-tools.html#open-graph
 website:
   open-graph:
@@ -49,7 +48,7 @@ license: CC BY # # Optionen für Lizensierungsangaben: https://quarto.org/docs/a
 # OERSI (vgl. https://oersi.gitlab.io/metadata-form/metadata-generator.html)
 bildungsstufe: https://w3id.org/kim/educationalLevel/level_A
 materialart: https://w3id.org/kim/hcrt/script
-status: Draft  # Draft, Incomplete, Published
+status: Draft # Draft, Incomplete, Published
 
 # Schema für eigene Key-Value-Paare mit Bindestrich: custom-key: "custom-value"
 beispiel-key: beispiel-value
