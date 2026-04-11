@@ -1,2 +1,19 @@
 project:
   type: website
+  output-dir: _site
+
+website:
+  title: "OER-Skript"
+  navbar:
+    left:
+      - text: "Skript"
+        href: index.qmd
+      - text: "Notebooks"
+        menu:
+          - text: "Wikidata Ogham Sites (interaktiv)"
+            href: notebooks/wikidata-ogham-sites-live.qmd
+          - text: "Wikidata Ogham Sites (statisch)"
+            href: notebooks/wikidata-ogham-sites.ipynb
+
+execute:
+  freeze: auto
