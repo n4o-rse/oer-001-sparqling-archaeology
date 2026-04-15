@@ -2,8 +2,8 @@ project:
   type: website
   output-dir: _site
   resources:
-    - notebooks/PotterAttributionExample.ttl
-    - notebooks/amt-python.ipynb
+    - notebooks_amt/PotterAttributionExample.ttl
+    - notebooks_amt/amt-python.ipynb
     - img/CC_SemanticLOD_Logo.png
 
 website:
@@ -12,12 +12,18 @@ website:
     left:
       - text: "Skript"
         href: index.qmd
-      - text: "Notebooks"
+      - text: "Jupyter Notebooks Linked Data"
         menu:
           - text: "Wikidata Ogham Sites (interaktiv)"
-            href: notebooks/wikidata-ogham-sites-live.qmd
+            href: notebooks_lod/wikidata-ogham-sites-live.qmd
+      - text: "Jupyter Notebooks Academic Meta Tool"
+        menu:
           - text: "AMT – Academic Meta Tool (interaktiv)"
-            href: notebooks/amt-live.qmd
+            href: notebooks_amt/amt-live.qmd
+      - text: "SPARQLing Unicorn"
+        menu:
+          - text: "QGIS Plugin SPARQL query"
+            href: unicorn/sparql-queries.qmd
 
 execute:
   freeze: auto
