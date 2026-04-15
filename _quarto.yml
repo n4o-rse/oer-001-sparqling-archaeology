@@ -5,6 +5,7 @@ project:
     - notebooks_amt/PotterAttributionExample.ttl
     - notebooks_amt/amt-python.ipynb
     - img/CC_SemanticLOD_Logo.png
+    - unicorn/unicorn_arno_sites.png
 
 website:
   title: "Knowledge Graphs in Action"

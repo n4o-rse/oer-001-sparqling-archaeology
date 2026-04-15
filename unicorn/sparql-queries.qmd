@@ -1,0 +1,39 @@
+# Queries
+
+## ArNO (Poseidon) NFDI4Objects Knowledge Graph
+
+![](unicorn_arno_sites.png)
+
+```sparql
+
+PREFIX arno: <http://archaeonatural.cloud/ont/>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX geosparql: <http://www.opengis.net/ont/geosparql#>
+
+SELECT ?item ?countryLabel ?geo (COUNT(DISTINCT ?sample) AS ?numSamples)
+WHERE {
+  GRAPH <https://graph.nfdi4objects.net/collection/17> {
+    ?sample rdf:type arno:aDNASample ;
+            arno:foundAtDiscoverySite ?discoverySite .
+
+    ?discoverySite geosparql:hasGeometry ?geom .
+    ?geom geosparql:asWKT ?geo .
+
+    OPTIONAL {
+      ?discoverySite arno:atSite ?site .
+      ?site rdfs:label ?item .
+    }
+
+    OPTIONAL {
+      ?discoverySite arno:atSite ?site .
+      ?site arno:atPlace ?place .
+      ?place arno:inCountry ?country .
+      ?country rdfs:label ?countryLabel .
+    }
+  }
+}
+GROUP BY ?item ?countryLabel ?geo
+ORDER BY DESC(?numSamples)
+
+```
