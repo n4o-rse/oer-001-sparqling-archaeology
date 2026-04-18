@@ -1,11 +1,265 @@
 # Queries
 
-## ArNO (Poseidon) NFDI4Objects Knowledge Graph
+This page collects example SPARQL queries for the SPARQLing Unicorn
+QGIS Plugin across four endpoints of increasing specificity:
+
+1. **Wikidata** — general-purpose, community-curated knowledge graph.
+2. **FactGrid** — Wikibase instance for historical research, ideal to
+   transfer Wikidata skills to a domain context.
+3. **Nomisma.org** — domain-specific vocabulary and data hub for
+   numismatics, built on a custom ontology (`nmo:`).
+4. **NFDI4Objects Knowledge Graph** — research infrastructure for
+   object-related data in archaeology, accessed per named graph
+   (`collection/*`).
+
+Each query can be pasted directly into the plugin's query editor
+(`Linked Data Processing → Concept Query`) and executed against the
+endpoint given at the top of each section. Where the plugin is
+GeoSPARQL-aware, the `?geo`, `?wkt`, or `?lat`/`?lon` variables are
+auto-detected and the results are rendered as a QGIS vector layer.
+
+## Wikidata — Ogham stones on the Dingle peninsula
+
+**Endpoint:** `https://query.wikidata.org/sparql`
+
+The classical SPARQL Unicorn worked example (Schmidt & Thiery 2022):
+all instances of *Ogham stone* (`wd:Q1865081`) whose find-spot lies on
+the Dingle peninsula. The query demonstrates two patterns that recur
+throughout this page: fetching a coordinate via `wdt:P625` (which the
+Unicorn plugin auto-converts to a GeoSPARQL WKT point) and restricting
+results by a transitive *located-in* chain (`wdt:P131*`) rather than
+an exact match.
+
+![](unicorn_wikidata_ogham_dingle.png)
+
+```sparql
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT DISTINCT ?stone ?stoneLabel ?geo WHERE {
+  ?stone wdt:P31 wd:Q1865081 ;           # instance of: Ogham stone
+         wdt:P189 ?findspot ;            # located on terrain feature
+         rdfs:label ?stoneLabel ;
+         wdt:P625 ?geo .
+  ?findspot wdt:P131* wd:Q1426863 .      # admin entity: Dingle peninsula
+  FILTER(LANG(?stoneLabel) = "en")
+}
+```
+
+## Wikidata — Holy Wells in Ireland and the UK
+
+**Endpoint:** `https://query.wikidata.org/sparql`
+
+The second Wikidata example queries Holy Wells curated as part of the
+Research Squirrel Engineers' *WikiProject HolyWells*. It returns every
+item typed as *Holy Well* (`wd:Q1371047`) from Ireland (`wd:Q27`) or
+the UK (`wd:Q145`), named after a male saint, with the saint's label
+used as the `?layer` variable — which the Unicorn plugin picks up as
+a categorical layer name in QGIS. Swap `wd:Q6581072` in for the
+`wdt:P21` value to flip to female saints.
+
+![](unicorn_wikidata_holywells.png)
+
+```sparql
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX wdt: <http://www.wikidata.org/prop/direct/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+SELECT DISTINCT ?item ?itemLabel ?namedAfter ?namedAfterLabel
+                ?geo ?layer
+WHERE {
+  ?item wdt:P31 wd:Q1371047 ;           # instance of: Holy Well
+        wdt:P625 ?geo ;                 # coordinate location
+        wdt:P138 ?namedAfter ;          # named after
+        wdt:P17 ?country .
+  VALUES ?country {
+    wd:Q27                              # Ireland
+    wd:Q145                             # United Kingdom
+  }
+  ?namedAfter wdt:P21 wd:Q6581097 ;     # sex: male  (female = Q6581072)
+              rdfs:label ?layer .
+  FILTER(LANG(?layer) = "en")
+  SERVICE wikibase:label {
+    bd:serviceParam wikibase:language "en"
+  }
+}
+ORDER BY ?layer ?itemLabel
+```
+
+## FactGrid — historical sites in Koblenz
+
+**Endpoint:** `https://database.factgrid.de/sparql`
+
+FactGrid is a Wikibase instance, so properties are `P…` but with their
+own IDs distinct from Wikidata. This query is taken from the FactGrid
+[*Mapping Koblenz*](https://database.factgrid.de/wiki/FactGrid:Mapping_Koblenz)
+project and returns every FactGrid item administratively located in
+Koblenz (`wd:Q922978`), together with its type (`P2`) and its
+coordinate (`P48`). The type label becomes the `?layerLabel` and can
+be used to colour the resulting points in QGIS by category.
+
+![](unicorn_factgrid_koblenz.png)
+
+```sparql
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX wdt: <https://database.factgrid.de/prop/direct/>
+
+SELECT ?item ?itemLabel ?geo ?layerLabel WHERE {
+  ?item wdt:P131 wd:Q922978 .    # located in the admin entity: Koblenz
+  ?item wdt:P2 ?layer .          # instance of (type)
+  ?item wdt:P48 ?geo .           # coordinate location
+  SERVICE wikibase:label {
+    bd:serviceParam wikibase:language "en"
+  }
+}
+ORDER BY ?layerLabel
+```
+
+::: {.callout-tip}
+The `wdt:` prefix above points to **FactGrid's** property namespace,
+not Wikidata's — even though the local name (`P131`, `P48`) overlaps
+visually. When you adapt a Wikidata query to FactGrid, you always
+need to re-check each property ID against FactGrid's own property
+catalogue.
+:::
+
+## FactGrid — pharmacies in Koblenz
+
+**Endpoint:** `https://database.factgrid.de/sparql`
+
+A narrower query from the same *Mapping Koblenz* project: every
+pharmacy (`P280 = wd:Q480860`, *is a*: pharmacy) operated by a
+pharmacist (`P47 = wd:Q10399`) and located in Koblenz. The
+coordinate is `OPTIONAL` so that pharmacies without a geo-reference
+still appear in the result — in QGIS they are filtered out of the
+map layer automatically but remain visible in the attribute table.
+
+![](unicorn_factgrid_pharmacies.png)
+
+```sparql
+PREFIX wd: <http://www.wikidata.org/entity/>
+PREFIX wdt: <https://database.factgrid.de/prop/direct/>
+
+SELECT ?Pharmacy ?PharmacyLabel ?Coordinate_location WHERE {
+  SERVICE wikibase:label {
+    bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en"
+  }
+  ?Pharmacy wdt:P280 wd:Q480860 ;    # is a: pharmacy
+            wdt:P47 wd:Q10399 ;      # operated by: pharmacist
+            wdt:P131 wd:Q922978 .    # admin entity: Koblenz
+  OPTIONAL { ?Pharmacy wdt:P48 ?Coordinate_location . }
+}
+```
+
+## Nomisma — all mints
+
+**Endpoint:** `https://nomisma.org/query`
+
+Nomisma uses its own ontology (`nmo:`) rather than Wikibase-style
+properties. A `nmo:Mint` is any entity that minted coins, and its
+geographical position comes via the standard WGS84 vocabulary. This
+query returns every mint concept defined in Nomisma together with its
+latitude and longitude — a good first query to get a feel for the
+geographical coverage of the vocabulary.
+
+![](unicorn_nomisma_mints.png)
+
+```sparql
+PREFIX nmo: <http://nomisma.org/ontology#>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+PREFIX wgs84_pos: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+
+SELECT ?item ?lat ?lon WHERE {
+  ?item a nmo:Mint .
+  ?item geo:location ?loc .
+  ?loc wgs84_pos:lat ?lat .
+  ?loc wgs84_pos:long ?lon .
+}
+```
+
+## Nomisma — coin findspots in Northamptonshire
+
+**Endpoint:** `https://nomisma.org/query`
+
+The second Nomisma query reaches into the actual specimen data
+contributed by partner projects (the British Museum, PAS, and others).
+It pulls numismatic objects whose findspot falls within
+Northamptonshire (`wikidata:Q23115`) via a transitive CIDOC-CRM path
+(`crm:P89_falls_within+`), together with their type series item and
+end date. Ordering by `?date` gives the chronological distribution of
+coin finds across the county — visualised in QGIS as a graduated
+symbology on the `date` field, as shown in the plugin screenshot.
+
+![](unicorn_nomisma_northamptonshire.png)
+
+```sparql
+PREFIX nmo: <http://nomisma.org/ontology#>
+PREFIX crm: <http://www.cidoc-crm.org/cidoc-crm/>
+PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
+
+SELECT ?item ?type ?date ?place ?lat ?lon WHERE {
+  ?item nmo:hasFindspot/crm:P7_took_place_at/crm:P89_falls_within ?place ;
+        nmo:hasTypeSeriesItem ?type ;
+        a nmo:NumismaticObject .
+  ?place crm:P89_falls_within+ <http://www.wikidata.org/entity/Q23115> .
+  ?type nmo:hasEndDate ?date .
+  ?place geo:location ?loc .
+  ?loc geo:lat ?lat ;
+       geo:long ?lon .
+}
+ORDER BY ASC(?date)
+```
+
+## NFDI4Objects KG — Ogham stones with *MAQI* inscriptions
+
+**Endpoint:** `https://graph.nfdi4objects.net/api/sparql`
+
+The NFDI4Objects Knowledge Graph partitions its content into named
+graphs, one per *collection*. Ogham-related research data is imported
+via the Ogham ontology (`oghamonto:`). This query returns every CIIC
+Ogham stone whose inscription reading contains the token *MAQI*
+(Old Irish *maq(q)i*, "son of") — one of the most frequent formulaic
+elements on Ogham stones, and a good filter to highlight
+genealogically relevant inscriptions across Ireland.
+
+![](unicorn_n4o_ogham_maqi.png)
+
+```sparql
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX geosparql: <http://www.opengis.net/ont/geosparql#>
+PREFIX ogham: <http://ontology.ogham.link/>
+PREFIX oghamonto: <http://ontology.ogham.link/ontology/>
+
+SELECT DISTINCT ?item ?geo ?itemLabel ?stone ?stoneLabel ?readingLabel
+WHERE {
+  ?stone oghamonto:shows ogham:OW6 ;
+         rdfs:label ?stoneLabel ;
+         a oghamonto:OghamStone_CIIC ;
+         oghamonto:disclosedAt ?item ;
+         oghamonto:carries ?inscription .
+  ?item rdfs:label ?itemLabel ;
+        geosparql:hasGeometry ?geom_obj .
+  ?geom_obj geosparql:asWKT ?geo .
+  ?inscription oghamonto:identifiedAs ?reading .
+  ?reading rdfs:label ?readingLabel .
+  FILTER(regex(?readingLabel, "MAQI"))
+}
+```
+
+## NFDI4Objects KG — ArNO (Poseidon) aDNA samples per site
+
+**Endpoint:** `https://graph.nfdi4objects.net/api/sparql`
+
+The ArNO (Archaeo-Natural Objects) dataset from Project Poseidon lives
+in `collection/17` and links aDNA samples to their discovery sites and
+administrative context. This query aggregates sample counts per site,
+carrying along the country label and the geometry — a good template
+for any *sample-per-site* aggregation over the NFDI4Objects graph.
 
 ![](unicorn_arno_sites.png)
 
 ```sparql
-
 PREFIX arno: <http://archaeonatural.cloud/ont/>
 PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
@@ -35,5 +289,4 @@ WHERE {
 }
 GROUP BY ?item ?countryLabel ?geo
 ORDER BY DESC(?numSamples)
-
 ```
