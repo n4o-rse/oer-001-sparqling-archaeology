@@ -505,22 +505,44 @@ heatmap_html = f"""
         // collapsed:true → Leaflet default, expands on hover / tap
         L.control.layers(baseLayers, overlays, {{ collapsed: true }}).addTo(map);
 
-        // --- Fullscreen fix for the heatmap canvas ---------------------
-        // leaflet.heat draws on a canvas sized at map-add time. When
-        // the container resizes (entering or leaving fullscreen) the
-        // canvas doesn't automatically repaint at the new size, so the
-        // heatmap visually disappears. We hook into the fullscreen
-        // plugin's `fullscreenchange` event, invalidate the map's size
-        // so Leaflet re-measures, and force the heatLayer to redraw.
-        if (hasFullscreen) {{
-            map.on('fullscreenchange', function() {{
-                setTimeout(function() {{
-                    map.invalidateSize();
-                    if (map.hasLayer(heatLayer) && typeof heatLayer.redraw === 'function') {{
-                        heatLayer.redraw();
-                    }}
-                }}, 200);
-            }});
+        // --- Fullscreen / resize fix for the heatmap canvas ------------
+        // leaflet.heat draws on a canvas sized at layer-add time.
+        // When the container resizes (fullscreen toggle, window
+        // resize, etc.), Leaflet doesn't automatically re-dimension
+        // the canvas, so the heatmap visually disappears.
+        //
+        // We use a three-pronged approach for robustness:
+        //
+        // 1. Native DOM `fullscreenchange` event (fires on every
+        //    browser fullscreen transition, more reliable than
+        //    Leaflet.fullscreen's own event which has had bugs).
+        // 2. A `ResizeObserver` on the map container — catches any
+        //    size change regardless of cause.
+        // 3. On each trigger: invalidateSize, then REMOVE + RE-ADD
+        //    the heat layer. Re-adding forces leaflet.heat's onAdd
+        //    handler to re-measure getSize() and redimension the
+        //    canvas. Just calling redraw() keeps the old canvas
+        //    dimensions, which is why the heatmap stays invisible.
+        function refreshHeatLayer() {{
+            setTimeout(function() {{
+                map.invalidateSize();
+                if (map.hasLayer(heatLayer)) {{
+                    map.removeLayer(heatLayer);
+                    map.addLayer(heatLayer);
+                }}
+            }}, 250);
+        }}
+
+        // (1) Native browser fullscreen events, all vendor prefixes
+        ['fullscreenchange', 'webkitfullscreenchange',
+         'mozfullscreenchange', 'MSFullscreenChange'].forEach(function(ev) {{
+            document.addEventListener(ev, refreshHeatLayer);
+        }});
+
+        // (2) ResizeObserver on the map container — broader safety net
+        if (typeof ResizeObserver !== 'undefined') {{
+            const ro = new ResizeObserver(function() {{ refreshHeatLayer(); }});
+            ro.observe(el);
         }}
 
         setTimeout(() => map.invalidateSize(), 200);
