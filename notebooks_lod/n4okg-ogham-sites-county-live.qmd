@@ -1,0 +1,274 @@
+---
+title: "NFDI4Objects KG — Ogham Sites by County"
+format: live-html
+engine: knitr
+pyodide:
+  packages:
+    - pandas
+    - matplotlib
+---
+
+{{< include ../_extensions/r-wasm/live/_knitr.qmd >}}
+
+## About this notebook
+
+This notebook introduces the
+[NFDI4Objects Knowledge Graph (N4O KG)](https://graph.nfdi4objects.net/)
+— a research-oriented triple store that integrates data about
+material cultural heritage from many partner repositories across
+Germany. We query it with SPARQL and count how many
+[Ogham stones](https://en.wikipedia.org/wiki/Ogham_inscription) are
+known from each Irish county, then visualise the distribution as a
+pie chart and scatter plot.
+
+It is part of an Open Educational Resource (OER) series on knowledge
+graphs and linked open data. It is designed to stand on its own:
+you do not need to have read any other notebook in the series to
+follow along. A local-Python variant of this notebook is available
+as `n4okg-ogham-sites-county.ipynb` (same content, for use with a
+regular Jupyter/VS Code setup).
+
+### Why this dataset?
+
+The Ogham corpus is one of several datasets hosted as a *named
+collection* inside the N4O KG (here:
+[`collection/9`](https://graph.nfdi4objects.net/collection/9)). It
+is useful for teaching because:
+
+- **The ontology is compact and domain-specific**
+  ([ontology.ogham.link](http://ontology.ogham.link/)), so queries
+  read almost like plain English once you know the three or four
+  relevant classes (`OghamSite`, `OghamStone_CIIC`, `County`).
+- **It exposes aggregation patterns well**: counting stones per
+  county requires a `GROUP BY` with a `COUNT(DISTINCT …)` — the
+  most common workhorse pattern in SPARQL analytics.
+- **It is small** (around two dozen counties, a few hundred
+  stones), so the whole dataset fits in memory and renders in a
+  browser without fuss.
+
+### Data-context notes
+
+N4O KG data is contributed by different research projects under
+shared infrastructure; every project brings its own ontology. The
+Ogham ontology (`oghamonto:`) is separate from the NFDI4Objects
+core vocabulary (`n4o:`). This is normal for domain-rich knowledge
+graphs and one of the reasons SPARQL is expressive: you can mix
+vocabularies freely in a single query.
+
+### Tooling notes
+
+- **`pyodide.http.pyfetch`** queries the N4O KG over HTTP. Libraries
+  like `SPARQLWrapper` depend on blocking HTTP and so do not work in
+  the browser; `pyfetch` is the browser-compatible equivalent. The
+  local `.ipynb` variant uses `SPARQLWrapper`, which is more
+  convenient when you are not browser-constrained.
+- **`pandas`** holds the results, so all subsequent aggregation and
+  plotting uses the standard data-science toolchain.
+- **`matplotlib`** for static visualisations. For maps of the same
+  dataset, see the companion notebook `n4okg-ogham-sites-map-live.qmd`.
+
+::: {.callout-note}
+On first load, your browser downloads the Python runtime
+(Pyodide, ~10 MB). Please allow a moment for it to initialise.
+:::
+
+::: {.callout-warning}
+The N4O KG is a research prototype. If this notebook fails to load
+data with a *network error*, the endpoint may be temporarily
+unreachable or may not allow cross-origin browser requests from
+this page's domain. The local `.ipynb` companion is not affected
+by this and is always a reliable fallback.
+:::
+
+## Step 1 — Defining the SPARQL query
+
+The query asks for every instance of `oghamonto:OghamSite`, looks
+up the `County` it lies in (via `oghamonto:within`), and counts how
+many catalogued Ogham stones (`oghamonto:OghamStone_CIIC`) have been
+disclosed at that site. We group by county.
+
+Two observations on query design that generalise beyond this dataset:
+
+- **`COUNT(DISTINCT ?stone)`** — not just `COUNT(?stone)`. A stone
+  could in principle be linked through more than one path; `DISTINCT`
+  makes sure we count each stone once.
+- **Full predicate URIs for `rdf:type`**: we spell
+  `<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>` rather than
+  using SPARQL's `a` shorthand here. Both work; the full URI is
+  sometimes preferred in educational contexts because it exposes the
+  underlying mechanics.
+
+```{pyodide}
+#| autorun: false
+#| label: setup
+import json
+import urllib.parse
+from pyodide.http import pyfetch
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+matplotlib.rcParams['figure.dpi'] = 120
+
+SPARQL_ENDPOINT = "https://graph.nfdi4objects.net/api/sparql"
+
+SPARQL_QUERY = """
+PREFIX oghamonto: <http://ontology.ogham.link/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?county (count(distinct ?stone) as ?count) WHERE {
+  ?item <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ontology.ogham.link/OghamSite> .
+  ?item oghamonto:within ?c .
+  ?c a oghamonto:County .
+  ?c rdfs:label ?county .
+  ?stone oghamonto:disclosedAt ?item .
+  ?stone a oghamonto:OghamStone_CIIC .
+} GROUP BY ?county ORDER BY DESC(?count)
+"""
+
+async def fetch_sparql(query, endpoint=SPARQL_ENDPOINT):
+    """Retrieve SPARQL results from a SPARQL 1.1 endpoint (browser-compatible)."""
+    full_url = endpoint + "?" + urllib.parse.urlencode(
+        {"query": query, "format": "json"}
+    )
+    response = await pyfetch(
+        full_url,
+        headers={"Accept": "application/sparql-results+json"},
+    )
+    data = await response.json()
+    return data["results"]["bindings"]
+
+print("✓ Helpers defined. Run the next cell to load the data.")
+```
+
+## Step 2 — Loading the data
+
+SPARQL results come back as JSON in a format called *bindings*: a list
+of dictionaries, one per solution, where each key maps to a
+`{"type": ..., "value": ...}` object. We flatten these into plain
+records and build a DataFrame.
+
+```{pyodide}
+#| autorun: false
+#| label: load-data
+results = await fetch_sparql(SPARQL_QUERY)
+
+rows = []
+for r in results:
+    rows.append({
+        "county": r["county"]["value"],
+        "count":  int(r["count"]["value"]),
+    })
+
+df = pd.DataFrame(rows)
+assert not df.empty, "⚠ Query returned zero rows — check endpoint and query."
+print(f"✓ {len(df)} counties loaded (total stones: {df['count'].sum()})")
+df
+```
+
+## Step 3 — Visualising the distribution
+
+### Pie chart with an "Other" bucket
+
+A pie chart is quick to read for a dozen or so categories but breaks
+down when many slices are tiny. We group every county that contributes
+less than 3 % of the total into a combined "Other" wedge, and label
+each slice with both its percentage and the raw stone count.
+
+```{pyodide}
+#| autorun: false
+#| label: pie-chart
+assert 'df' in dir() and not df.empty, "⚠ Please run the data-loading cell first."
+
+# Compute the percentage for each county
+total_count = df["count"].sum()
+df_pct = df.assign(percentage=df["count"] / total_count * 100)
+
+# Separate major (≥3%) from minor (<3%) and group the minors into "Other"
+major = df_pct[df_pct["percentage"] >= 3].copy()
+minor = df_pct[df_pct["percentage"] < 3]
+
+if not minor.empty:
+    other_row = pd.DataFrame([{
+        "county":     "Other",
+        "count":      minor["count"].sum(),
+        "percentage": minor["percentage"].sum(),
+    }])
+    major = pd.concat([major, other_row], ignore_index=True)
+
+major = major.sort_values("count", ascending=False)
+
+def make_autopct(values):
+    def _autopct(pct):
+        count = int(round(pct * sum(values) / 100.0))
+        return f"{pct:.1f}% ({count:d})"
+    return _autopct
+
+fig, ax = plt.subplots(figsize=(9, 9))
+major.set_index("county")["count"].plot(
+    kind="pie",
+    ax=ax,
+    autopct=make_autopct(major["count"]),
+    startangle=90,
+    colors=plt.cm.Paired.colors,
+)
+ax.set_title("Distribution of Ogham sites by county (<3 % grouped as 'Other')",
+             fontsize=13)
+ax.set_ylabel("")  # remove default label
+plt.tight_layout()
+plt.show()
+```
+
+### Scatter plot
+
+A scatter plot per county makes the long tail of low-count counties
+easier to see than the pie chart does. We show the raw count with the
+county label annotated.
+
+```{pyodide}
+#| autorun: false
+#| label: scatter-plot
+assert 'df' in dir() and not df.empty, "⚠ Please run the data-loading cell first."
+
+fig, ax = plt.subplots(figsize=(12, 5))
+x = range(len(df))
+ax.scatter(x, df["count"], color="steelblue", s=60)
+ax.set_title("Stone count per county")
+ax.set_xlabel("County")
+ax.set_ylabel("Stone count")
+ax.set_xticks(x)
+ax.set_xticklabels([f"{c} [{n}]" for c, n in zip(df["county"], df["count"])],
+                   rotation=45, ha="right")
+ax.grid(color="lightgrey", linestyle="--", linewidth=0.5)
+plt.tight_layout()
+plt.show()
+```
+
+## Step 4 — Exploring the data
+
+The cells below are a free playground — try answering questions of
+your own by modifying the DataFrame or the SPARQL query.
+
+```{pyodide}
+#| autorun: false
+#| label: explore
+assert 'df' in dir(), "⚠ Please run the data-loading cell first."
+
+# Example: the five counties with the most Ogham stones.
+print("Top-five counties by stone count:")
+df.head(5)
+```
+
+```{pyodide}
+#| autorun: false
+#| label: explore-2
+# Example: how many counties account for 80 % of all stones?
+assert 'df' in dir(), "⚠ Please run the data-loading cell first."
+
+cumulative = df["count"].cumsum() / df["count"].sum()
+n80 = int((cumulative < 0.80).sum()) + 1
+print(f"{n80} counties out of {len(df)} account for 80 % of all Ogham stones.")
+```
+
+---
+
+*This notebook is part of the Open Educational Resources of
+[NFDI4Objects](https://www.nfdi4objects.net/).*

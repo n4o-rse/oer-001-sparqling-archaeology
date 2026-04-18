@@ -1,0 +1,689 @@
+---
+title: "NFDI4Objects KG — Ogham Sites on a Map"
+format: live-html
+engine: knitr
+pyodide:
+  packages:
+    - pandas
+---
+
+{{< include ../_extensions/r-wasm/live/_knitr.qmd >}}
+
+## About this notebook
+
+This notebook takes the same
+[NFDI4Objects Knowledge Graph](https://graph.nfdi4objects.net/)
+dataset that the companion notebook `n4okg-ogham-sites-county-live.qmd`
+visualises as counts, and plots each individual
+[Ogham site](http://ontology.ogham.link/OghamSite) on two interactive
+[Leaflet](https://leafletjs.com/) maps. The first map shows
+individual sites as county-coloured markers with pop-up details;
+the second shows the same points styled by stone count — marker
+size and colour both encode how many stones were disclosed at each
+site, making regional concentration visible at a glance.
+
+It is part of an Open Educational Resource series on knowledge
+graphs and linked open data, and is designed to stand on its own:
+you do not need to have read any other notebook in the series to
+follow along. A local-Python variant of this notebook is available
+as `n4okg-ogham-sites-map.ipynb`.
+
+### Why this dataset?
+
+Ogham sites from the N4O KG's
+[`collection/9`](https://graph.nfdi4objects.net/collection/9) are a
+good fit for a map teaching example because:
+
+- Each site has a **GeoSPARQL `hasGeometry`/`asWKT` literal** with
+  explicit WKT point coordinates — a common, well-specified
+  encoding that generalises to many other knowledge graphs.
+- The **stone-count-per-site** metadata is rich enough for two
+  different map treatments: a categorical view coloured by county,
+  and a density-weighted heatmap.
+- The sites concentrate in just two Irish regions, so the map is
+  geographically interesting without being sparse.
+
+### Data-context notes
+
+Two subtleties about coordinates that we handle here and that
+generalise to other GeoSPARQL-using KGs:
+
+- **WKT is `lon lat`, Leaflet is `lat, lon`.** Getting this the
+  wrong way round is one of the most common mistakes when plotting
+  spatial data — the kind of bug where everything "works" but all
+  your points end up in the wrong hemisphere. Our parser swaps the
+  order explicitly.
+- **Some endpoints uppercase the `POINT` keyword, some don't.**
+  Wikidata writes `Point(...)`, the N4O KG writes `POINT(...)`.
+  Our parser is case-insensitive, which is a reasonable defensive
+  posture when working across endpoints.
+
+A third point worth mentioning: N4O KG data is contributed by many
+projects under shared infrastructure, each with its own ontology.
+The Ogham ontology (`oghamonto:`) is separate from the NFDI4Objects
+core vocabulary. This is normal for domain-rich knowledge graphs
+and one of the reasons SPARQL is expressive: you can mix
+vocabularies freely in a single query.
+
+### Tooling notes
+
+Rendering an interactive map in a browser-only notebook is
+slightly unusual, because the Python libraries most people know for
+this (`folium`, `geopandas`, `contextily`) do not work well in
+Pyodide: `folium` expects to write HTML files, `geopandas` has
+heavy binary dependencies (GDAL, GEOS, PROJ), and `contextily`
+needs server-side HTTP. The local `.ipynb` companion happily uses
+`folium`; the browser variant instead builds an HTML snippet with
+embedded Leaflet JavaScript and returns it as the cell's output.
+
+There is one additional browser-specific constraint worth knowing
+about: `quarto-live` runs Python inside a **Web Worker**, which has
+*no DOM access*. That means `js.document`, `js.eval()` targeting the
+DOM, and any direct manipulation of page elements from Python will
+fail with `ReferenceError: document is not defined`. The working
+pattern is the one used below: Python *builds* an HTML string
+containing the map container and the Leaflet-initialisation script,
+then returns it as the cell value. `quarto-live` inserts that HTML
+into the page on the main thread, where the browser has full DOM
+access and runs the embedded JavaScript normally.
+
+::: {.callout-note}
+On first load, your browser downloads the Python runtime (Pyodide, ~10 MB)
+and the Leaflet library (~150 KB). Please allow a moment for these
+to initialise.
+:::
+
+::: {.callout-warning}
+The N4O KG is a research prototype. If this notebook fails to load
+data with a *network error*, the endpoint may be temporarily
+unreachable or may not allow cross-origin browser requests from
+this page's domain. The local `.ipynb` companion is not affected
+by this and is always a reliable fallback.
+:::
+
+## Step 1 — Defining the SPARQL query
+
+The query below asks the N4O KG for every `oghamonto:OghamSite`,
+its label, its GeoSPARQL geometry, the `County` it lies in, and a
+count of catalogued Ogham stones (`oghamonto:OghamStone_CIIC`)
+disclosed at that site. We group by site — one row per site with
+its aggregated stone count.
+
+Two notes on query design that generalise to other knowledge-graph
+queries:
+
+- **`geo:hasGeometry/geo:asWKT`** uses SPARQL property-path
+  notation to traverse two predicates in a single triple pattern.
+  It is equivalent to introducing an intermediate variable, but
+  shorter.
+- **`COUNT(DISTINCT ?stone)`** — not just `COUNT(?stone)`. A stone
+  could in principle be linked through more than one path;
+  `DISTINCT` makes sure we count each stone once.
+
+```{pyodide}
+#| autorun: false
+#| label: setup
+import json
+import re
+import urllib.parse
+from pyodide.http import pyfetch
+import pandas as pd
+
+SPARQL_ENDPOINT = "https://graph.nfdi4objects.net/api/sparql"
+
+SPARQL_QUERY = """
+PREFIX oghamonto: <http://ontology.ogham.link/>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+SELECT ?item ?label ?geo ?county (count(distinct ?stone) as ?count) WHERE {
+  ?item <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ontology.ogham.link/OghamSite> .
+  ?item rdfs:label ?label .
+  ?item geo:hasGeometry/geo:asWKT ?geo .
+  ?item oghamonto:within ?c .
+  ?c a oghamonto:County .
+  ?c rdfs:label ?county .
+  ?stone oghamonto:disclosedAt ?item .
+  ?stone a oghamonto:OghamStone_CIIC .
+} GROUP BY ?item ?label ?geo ?county ORDER BY DESC(?count)
+"""
+
+async def fetch_sparql(query, endpoint=SPARQL_ENDPOINT):
+    """Retrieve SPARQL results from a SPARQL 1.1 endpoint (browser-compatible)."""
+    full_url = endpoint + "?" + urllib.parse.urlencode(
+        {"query": query, "format": "json"}
+    )
+    response = await pyfetch(
+        full_url,
+        headers={"Accept": "application/sparql-results+json"},
+    )
+    data = await response.json()
+    return data["results"]["bindings"]
+
+# Case-insensitive WKT parser: handles both 'Point(...)' (Wikidata) and
+# 'POINT(...)' (N4O KG) and variations; also tolerates an optional SRID prefix
+# like '<http://www.opengis.net/def/crs/OGC/1.3/CRS84> Point(...)'.
+_WKT_POINT_RE = re.compile(r"point\s*\(\s*([-+\d.eE]+)\s+([-+\d.eE]+)\s*\)",
+                           re.IGNORECASE)
+
+def parse_wkt_point(wkt):
+    """Parse a WKT Point literal 'POINT(lon lat)' (any case) into (lat, lon)."""
+    if not wkt:
+        return (None, None)
+    m = _WKT_POINT_RE.search(wkt)
+    if not m:
+        return (None, None)
+    try:
+        lon, lat = float(m.group(1)), float(m.group(2))
+        return (lat, lon)
+    except ValueError:
+        return (None, None)
+
+print("✓ Helpers defined. Run the next cell to load the data.")
+```
+
+## Step 2 — Loading the data
+
+The `parse_wkt_point` helper defined above converts each
+`POINT(lon lat)` literal into a `(lat, lon)` tuple. Note the
+ordering: WKT is `lon lat`, but Leaflet (and most mapping libraries)
+expect `lat, lon`. Getting this the wrong way round is one of the
+most common mistakes when plotting spatial data — the kind of bug
+where everything "works" but all your points end up in the wrong
+hemisphere.
+
+```{pyodide}
+#| autorun: false
+#| label: load-data
+results = await fetch_sparql(SPARQL_QUERY)
+
+rows = []
+for r in results:
+    lat, lon = parse_wkt_point(r.get("geo", {}).get("value"))
+    rows.append({
+        "item":      r["item"]["value"],
+        "label":     r["label"]["value"],
+        "county":    r["county"]["value"],
+        "count":     int(r["count"]["value"]),
+        "latitude":  lat,
+        "longitude": lon,
+    })
+
+df = pd.DataFrame(rows).dropna(subset=["latitude", "longitude"])
+assert not df.empty, "⚠ No records with coordinates returned — check query."
+print(f"✓ {len(df)} Ogham sites loaded across {df['county'].nunique()} counties "
+      f"(total stones: {df['count'].sum()}).")
+df.head()
+```
+
+## Step 3a — Map with county-coloured markers
+
+We build the first map as an HTML string in Python and return it as
+the cell's value via a `_repr_html_`-reprable object. `quarto-live`
+inserts the HTML on the main thread, where the browser happily runs
+the embedded `<script>` with full DOM access.
+
+This first map loads only core Leaflet, plus the
+[`Leaflet.fullscreen`](https://github.com/Leaflet/Leaflet.fullscreen)
+plugin for the maximise-to-fullscreen button under the zoom controls.
+
+A [layer control](https://leafletjs.com/examples/layers-control/) in
+the top-right corner (expand it by hovering or tapping) offers four
+base layers — OpenStreetMap as the default, the Humanitarian OSM
+style, Esri satellite imagery, and Esri's world terrain base — and
+one overlay *per county*, each with its colour swatch in the label.
+Unchecking a county hides just its markers, so you can isolate
+regions interactively. All provider URLs and attributions are taken
+from the
+[leaflet-providers registry](https://github.com/leaflet-extras/leaflet-providers).
+
+```{pyodide}
+#| autorun: false
+#| label: render-markers-map
+assert 'df' in dir() and not df.empty, "⚠ Please run the data-loading cell first."
+
+import uuid
+
+# --- 1. Assign a colour to each county (reused across both maps) ---------
+palette = [
+    "#e6194B", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
+    "#42d4f4", "#f032e6", "#469990", "#9A6324", "#800000",
+    "#808000", "#000075", "#e6beff", "#fabed4", "#aaffc3",
+    "#fffac8", "#dcbeff", "#ffd8b1", "#a9a9a9", "#ffe119",
+]
+counties = sorted(df["county"].unique())
+county_colors = {c: palette[i % len(palette)] for i, c in enumerate(counties)}
+
+# --- 2. Prepare records as plain JSON-serialisable dicts -----------------
+markers = [
+    {
+        "lat":    float(row["latitude"]),
+        "lon":    float(row["longitude"]),
+        "name":   row["label"],
+        "county": row["county"],
+        "count":  int(row["count"]),
+        "color":  county_colors[row["county"]],
+        "url":    row["item"],
+    }
+    for _, row in df.iterrows()
+]
+
+# Sorted county names paired with colours — JS will build one layer per county
+county_list = [{"county": c, "color": county_colors[c]} for c in counties]
+markers_payload = json.dumps({"markers": markers, "counties": county_list})
+
+# --- 3. A unique id so re-runs don't collide with previous renders -------
+markers_map_id = f"ogham-markers-{uuid.uuid4().hex[:8]}"
+markers_data_var = f"__oghamMarkersData_{markers_map_id.replace('-', '_')}"
+
+# --- 4. Build the HTML + JS string ---------------------------------------
+markers_html = f"""
+<div id="{markers_map_id}" style="height:560px;width:100%;border:1px solid #ddd;border-radius:4px;margin-top:8px"></div>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.css" />
+<script>window["{markers_data_var}"] = {markers_payload};</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+    const mapId = "{markers_map_id}";
+    const data = window["{markers_data_var}"];
+
+    // Load Leaflet.fullscreen dynamically AFTER core Leaflet is ready.
+    // Same pattern as the heatmap plugin: avoid the race where a parallel
+    // <script> tag evaluates before L is defined.
+    function loadFullscreenPlugin(cb) {{
+        if (typeof L !== 'undefined' && L.control.fullscreen) return cb();
+        if (typeof L === 'undefined') return setTimeout(() => loadFullscreenPlugin(cb), 50);
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.js';
+        s.onload = cb;
+        document.head.appendChild(s);
+    }}
+
+    let initAttempts = 0;
+    const MAX_ATTEMPTS = 40;  // 40 × 50ms = 2 seconds total grace period
+
+    function init() {{
+        const el = document.getElementById(mapId);
+        if (!el || typeof L === 'undefined') return setTimeout(init, 50);
+        if (el._leaflet_id) return;
+
+        // Fullscreen plugin is optional; wait briefly, then proceed without it
+        const hasFullscreen = !!(L.control && L.control.fullscreen);
+        if (!hasFullscreen && initAttempts < MAX_ATTEMPTS) {{
+            initAttempts++;
+            return setTimeout(init, 50);
+        }}
+
+        // --- Base layers (one active at a time) ------------------------
+        // URLs and attributions taken from the leaflet-providers registry:
+        // https://github.com/leaflet-extras/leaflet-providers
+        const osm = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }});
+        const osmHOT = L.tileLayer('https://{{s}}.tile.openstreetmap.fr/hot/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, '
+                + 'Tiles style by <a href="https://www.hotosm.org/" target="_blank">Humanitarian OpenStreetMap Team</a> '
+                + 'hosted by <a href="https://openstreetmap.fr/" target="_blank">OpenStreetMap France</a>'
+        }});
+        const esriImagery = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 18,
+            attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, '
+                + 'Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+        }});
+        const esriTerrain = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 13,  // Esri caps World_Terrain_Base at zoom 13
+            attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA, DeLorme, and NPS'
+        }});
+
+        // --- Overlays: one layer per county ---------------------------
+        // Each county gets its own L.layerGroup so it can be toggled
+        // independently. The marker colour comes from the same palette
+        // used elsewhere in the notebook.
+        const countyLayers = {{}};
+        const allBounds = [];
+        for (const c of data.counties) {{
+            countyLayers[c.county] = L.layerGroup();
+        }}
+        for (const m of data.markers) {{
+            const marker = L.circleMarker([m.lat, m.lon], {{
+                radius: 6, color: m.color, weight: 1.5,
+                fillColor: m.color, fillOpacity: 0.75
+            }}).bindPopup(
+                '<b>' + m.name + '</b><br>' +
+                'County: ' + m.county + '<br>' +
+                'Ogham stones: ' + m.count + '<br>' +
+                '<a href="' + m.url + '" target="_blank" rel="noopener">Site URI &#8599;</a>'
+            );
+            marker.addTo(countyLayers[m.county]);
+            allBounds.push([m.lat, m.lon]);
+        }}
+
+        // --- Create map, show OSM + all county layers by default -------
+        // Build an HTML legend swatch inside each overlay label so the
+        // layer-control doubles as a colour key.
+        const initialLayers = [osm];
+        const overlays = {{}};
+        for (const c of data.counties) {{
+            initialLayers.push(countyLayers[c.county]);
+            const swatch = '<span style="display:inline-block;width:10px;height:10px;'
+                + 'background:' + c.color + ';border-radius:50%;'
+                + 'margin-right:6px;vertical-align:middle"></span>';
+            overlays[swatch + c.county] = countyLayers[c.county];
+        }}
+
+        const mapOptions = {{
+            center: [53.0, -8.0], zoom: 7,
+            layers: initialLayers
+        }};
+        if (hasFullscreen) {{
+            mapOptions.fullscreenControl = true;
+            mapOptions.fullscreenControlOptions = {{ position: 'topleft' }};
+        }}
+        const map = L.map(mapId, mapOptions);
+        if (allBounds.length) map.fitBounds(allBounds, {{ padding: [30, 30] }});
+
+        const baseLayers = {{
+            "OpenStreetMap": osm,
+            "OpenStreetMap.HOT": osmHOT,
+            "Esri.WorldImagery": esriImagery,
+            "Esri.WorldTerrain": esriTerrain
+        }};
+        // collapsed:true → Leaflet default, expands on hover / tap
+        L.control.layers(baseLayers, overlays, {{ collapsed: true }}).addTo(map);
+
+        setTimeout(() => map.invalidateSize(), 200);
+    }}
+
+    loadFullscreenPlugin(init);
+}})();
+</script>
+"""
+
+class _Html:
+    def __init__(self, s): self._s = s
+    def _repr_html_(self): return self._s
+
+_Html(markers_html)
+```
+
+## Step 3b — Map styled by stone count
+
+The second map shows the *same* sites as Step 3a, but here the
+stone count per site drives the visual encoding: each marker's
+**radius is proportional to the count**, and its **colour follows
+a continuous `viridis` gradient** from low (dark purple) to high
+(bright yellow). The two encodings reinforce each other — busy
+sites stand out clearly, whereas in a density heatmap they would
+blur together with their neighbours.
+
+A design note on why this is not a heatmap: heatmaps are best at
+answering *"where are points concentrated in space?"*, not
+*"where are the large values?"*. Since our dataset has
+well-separated sites with very uneven counts (one site with 30+
+stones, many with just one or two), a density heatmap weighted by
+count drowns the low-count sites in a hazy background and makes
+the high-count ones barely distinguishable. Proportional circles
+are the honest visualisation here.
+
+The map re-uses the four base layers from Step 3a and adds the
+same fullscreen control. Because the overlays are SVG
+`CircleMarker`s (not a canvas heatmap), no special redraw
+handling is needed on fullscreen toggle.
+
+```{pyodide}
+#| autorun: false
+#| label: render-count-map
+assert 'df' in dir() and not df.empty, "⚠ Please run the data-loading cell first."
+assert 'markers' in dir(), "⚠ Please run the previous cell (Step 3a) first."
+
+count_map_id = f"ogham-counts-{uuid.uuid4().hex[:8]}"
+count_data_var = f"__oghamCountData_{count_map_id.replace('-', '_')}"
+
+# The busiest site drives the radius scale. Small radii on low counts
+# keep every site visible; large radii on high counts immediately
+# draw the eye to where the action is.
+max_count = max(m["count"] for m in markers)
+
+# Passing the full marker records plus max_count — JS handles radius
+# and colour mapping so that the legend and the markers stay in sync.
+count_payload = json.dumps({"markers": markers, "max_count": max_count})
+
+count_html = f"""
+<div id="{count_map_id}" style="height:560px;width:100%;border:1px solid #ddd;border-radius:4px;margin-top:8px"></div>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.css" />
+<script>window["{count_data_var}"] = {count_payload};</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+    const mapId = "{count_map_id}";
+    const data = window["{count_data_var}"];
+
+    // Load Leaflet.fullscreen dynamically after core Leaflet is ready.
+    function loadFullscreen(cb) {{
+        if (typeof L !== 'undefined' && L.control && L.control.fullscreen) return cb();
+        if (typeof L === 'undefined') return setTimeout(() => loadFullscreen(cb), 50);
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.js';
+        s.onload = cb;
+        document.head.appendChild(s);
+    }}
+
+    // Viridis colormap, 10 stops sampled from matplotlib's canonical scheme.
+    const VIRIDIS = ['#440154', '#482878', '#3E4A89', '#31688E',
+                     '#26828E', '#1F9E89', '#35B779', '#6DCD59',
+                     '#B4DE2C', '#FDE725'];
+
+    // Discretise counts into N bins with equal-width ranges starting at 1.
+    // Returning a bin index lets markers and legend share the same colour
+    // logic — no "continuous markers, discrete legend" mismatch.
+    const N_BINS = 5;
+
+    function binRanges(maxCount) {{
+        // Bin 0: [1, hi0], bin 1: [hi0+1, hi1], ..., bin N-1: [..., maxCount]
+        const step = Math.ceil(maxCount / N_BINS);
+        const ranges = [];
+        for (let i = 0; i < N_BINS; i++) {{
+            const lo = i * step + 1;
+            const hi = Math.min((i + 1) * step, maxCount);
+            ranges.push([lo, hi]);
+        }}
+        return ranges;
+    }}
+
+    function binIndex(count, maxCount) {{
+        const step = Math.ceil(maxCount / N_BINS);
+        return Math.min(Math.floor((count - 1) / step), N_BINS - 1);
+    }}
+
+    function binColor(idx) {{
+        // Pick colour from the *middle* of each bin's share of the viridis
+        // gradient, so bins are clearly different but not at the extremes.
+        const t = (idx + 0.5) / N_BINS;
+        const vi = Math.min(Math.floor(t * VIRIDIS.length), VIRIDIS.length - 1);
+        return VIRIDIS[vi];
+    }}
+
+    // Radius: sqrt scaling so that *area* (not radius) is proportional to
+    // count — perceptually this is what the eye judges. 5 px floor so the
+    // smallest site is still clickable; 22 px cap so the biggest doesn't
+    // overwhelm the map.
+    function radiusFor(count, maxCount) {{
+        const t = Math.sqrt(count / maxCount);
+        return 5 + t * 17;
+    }}
+
+    let attempts = 0;
+    const MAX_ATTEMPTS = 40;
+
+    function init() {{
+        const el = document.getElementById(mapId);
+        if (!el || typeof L === 'undefined') return setTimeout(init, 50);
+        if (el._leaflet_id) return;
+
+        const hasFullscreen = !!(L.control && L.control.fullscreen);
+        if (!hasFullscreen && attempts < MAX_ATTEMPTS) {{
+            attempts++;
+            return setTimeout(init, 50);
+        }}
+
+        // --- Base layers (same four as Step 3a) ------------------------
+        const osm = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }});
+        const osmHOT = L.tileLayer('https://{{s}}.tile.openstreetmap.fr/hot/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, '
+                + 'Tiles style by <a href="https://www.hotosm.org/" target="_blank">Humanitarian OpenStreetMap Team</a> '
+                + 'hosted by <a href="https://openstreetmap.fr/" target="_blank">OpenStreetMap France</a>'
+        }});
+        const esriImagery = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 18,
+            attribution: 'Tiles &copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, '
+                + 'Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+        }});
+        const esriTerrain = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 13,
+            attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA, DeLorme, and NPS'
+        }});
+
+        // --- Overlay: one CircleMarker per site ------------------------
+        const countLayer = L.layerGroup();
+        const allBounds = [];
+        for (const m of data.markers) {{
+            const bi = binIndex(m.count, data.max_count);
+            L.circleMarker([m.lat, m.lon], {{
+                radius:      radiusFor(m.count, data.max_count),
+                color:       '#333',
+                weight:      1,
+                fillColor:   binColor(bi),
+                fillOpacity: 0.85
+            }}).bindPopup(
+                '<b>' + m.name + '</b><br>' +
+                'County: ' + m.county + '<br>' +
+                'Ogham stones: <b>' + m.count + '</b><br>' +
+                '<a href="' + m.url + '" target="_blank" rel="noopener">Site URI &#8599;</a>'
+            ).addTo(countLayer);
+            allBounds.push([m.lat, m.lon]);
+        }}
+
+        const mapOptions = {{
+            center: [53.0, -8.0], zoom: 7,
+            layers: [osm, countLayer]
+        }};
+        if (hasFullscreen) {{
+            mapOptions.fullscreenControl = true;
+            mapOptions.fullscreenControlOptions = {{ position: 'topleft' }};
+        }}
+        const map = L.map(mapId, mapOptions);
+        if (allBounds.length) map.fitBounds(allBounds, {{ padding: [30, 30] }});
+
+        const baseLayers = {{
+            "OpenStreetMap": osm,
+            "OpenStreetMap.HOT": osmHOT,
+            "Esri.WorldImagery": esriImagery,
+            "Esri.WorldTerrain": esriTerrain
+        }};
+        const overlays = {{
+            "Sites (colour / size = stone count)": countLayer
+        }};
+        L.control.layers(baseLayers, overlays, {{ collapsed: true }}).addTo(map);
+
+        // --- Colour-scale legend in the bottom-right -------------------
+        // One row per bin, labelled with the range it covers. Marker
+        // colours come from the exact same binColor() function, so the
+        // legend matches what's on the map.
+        const legend = L.control({{ position: 'bottomright' }});
+        legend.onAdd = function() {{
+            const div = L.DomUtil.create('div');
+            div.style.cssText = 'background:rgba(255,255,255,0.92);'
+                + 'padding:8px 12px;border-radius:4px;'
+                + 'font:12px/1.5 system-ui,sans-serif;'
+                + 'box-shadow:0 1px 4px rgba(0,0,0,0.2)';
+            const ranges = binRanges(data.max_count);
+            let html = '<b>Stones per site</b><br>';
+            // Highest bin at the top of the legend
+            for (let i = N_BINS - 1; i >= 0; i--) {{
+                const [lo, hi] = ranges[i];
+                const label = (lo === hi) ? ('' + lo) : (lo + '–' + hi);
+                html += '<span style="display:inline-block;width:14px;height:14px;'
+                    + 'background:' + binColor(i) + ';'
+                    + 'border:1px solid #333;border-radius:50%;'
+                    + 'margin-right:6px;vertical-align:middle"></span>'
+                    + label + '<br>';
+            }}
+            div.innerHTML = html;
+            return div;
+        }};
+        legend.addTo(map);
+
+        setTimeout(() => map.invalidateSize(), 200);
+    }}
+
+    loadFullscreen(init);
+}})();
+</script>
+"""
+
+_Html(count_html)
+```
+
+## Step 4 — Exploring the data
+
+The cells below are a free playground — filter the DataFrame by
+county, compute per-county aggregates, or extend the query
+yourself. Remember: in this notebook *one row = one site*, with a
+`count` column holding the number of Ogham stones disclosed there.
+
+```{pyodide}
+#| autorun: false
+#| label: explore
+assert 'df' in dir(), "⚠ Please run the data-loading cell first."
+
+# Example: list every Ogham site from a given county, with coordinates
+# and stone counts. Change the filter below to explore other counties.
+county_filter = "Kerry"
+
+subset = (
+    df[df["county"] == county_filter]
+      [["label", "count", "latitude", "longitude"]]
+      .sort_values("count", ascending=False)
+      .reset_index(drop=True)
+)
+print(f"Ogham sites in {county_filter}: {len(subset)} "
+      f"(total stones: {subset['count'].sum()})")
+subset
+```
+
+```{pyodide}
+#| autorun: false
+#| label: explore-stats
+assert 'df' in dir(), "⚠ Please run the data-loading cell first."
+
+# Per-county summary: number of sites, total stone count, and the
+# geographic centroid of the sites. The centroid is a quick sanity
+# check — it should fall inside the county on the map.
+summary = (
+    df.groupby("county")
+      .agg(
+          n_sites=("item", "nunique"),
+          n_stones=("count", "sum"),
+          mean_lat=("latitude", "mean"),
+          mean_lon=("longitude", "mean"),
+      )
+      .sort_values("n_stones", ascending=False)
+)
+summary
+```
+
+---
+
+*This notebook is part of the Open Educational Resources of
+[NFDI4Objects](https://www.nfdi4objects.net/).*
