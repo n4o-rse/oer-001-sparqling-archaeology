@@ -10,18 +10,23 @@ funding: |
 # Open Graph Metadaten für HTML-Header: https://quarto.org/docs/websites/website-tools.html#open-graph
 website:
   open-graph:
-    locale: de_DE
+    locale: en_GB
     type: article
 
 # Erschließung der Inhalte mit Quarto
 # Mit categories und keywords können die Inhalte von Quarto-Dokumenten auf zwei Ebenen erschlossen werden. Übersichtsseiten mit Suchfunktion lassen sich so automatisch mit Quarto erstellen. vgl. https://quarto.org/docs/websites/website-listings.html
 # Für 'categories' sollte das kontrollierte Vokabular der dini-AG "Kompetenzzentrum Interoperable Metadaten (KIM)" genutzt werden: https://skohub.io/dini-ag-kim/hcrt/heads/master/w3id.org/kim/hcrt/index.html
 categories:
-  - Skript
+  - Drill and Practice
 # Für die inhaltliche Erschließung keywords/Stichworte/tags sollte ein kontrolliertes Vokabular genutzt werden.
 keywords:
-  - Stichwort 1
-  - Stichwort 2
+  - Linked Open Data
+  - Wikidata
+  - NFDI4Objects
+  - Knowledge Graph
+  - Jupyter Notebook
+  - QGIS
+  - Vagueness
 
 # Technische Metadaten
 site-url: &site https://nfdi4objects.github.io/oer-template-skript/
@@ -40,7 +45,7 @@ citation:
   license: "https://creativecommons.org/licenses/by/4.0/"
 
 # Rechtliche Metadaten
-copyright: "Freitext-Angaben zu Inhaber:innen des Urheberrechts an den Inhalten (Anzupassen im Schlüssel `copyright` in der Datei `_oer_metadata.yml`)"
+copyright: "Florian Thiery (2026)"
 license: CC BY # # Optionen für Lizensierungsangaben: https://quarto.org/docs/authoring/front-matter.html#license. Wird übernommen in automatisch erstellten Appendix "Lizenz".
 
 # Spezifische Metadaten für den Export in fachliche Metadatenschemata

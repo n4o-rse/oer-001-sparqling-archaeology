@@ -68,6 +68,10 @@ Viele Hinweise dazu finden sie im [Quarto-Guide](https://quarto.org/docs/guide/)
 
 -->
 
+## Literature
+
+[@petersen2023]
+
 
 ## Weiterführende Quellen und Informationen {.appendix .unnumbered}
 
@@ -92,6 +96,8 @@ Dieses Skript nutzt das [OER-Skript-Template von NFDI4Objects](https://github.co
 ## Disclaimer: Einsatz von LLM {.appendix .unnumbered}
 
 <!-- Optionale Angaben zum Einsatz von LLM bei der Erstellung oder Überarbeitung des Skripts -->
+
+TODO, hier muss rein, dass der OER und die ganzen skripte mit Hilfe von AI (insb. Claude.ai) estellt wurden, aber validiert vom Autor. Wichtig hier ist skripte MIT lizenz, also ohne gewähr!
 
 <!-- An dieser Stelle werden von Quarto automatisch generierte Abschnitte angehängt:
 

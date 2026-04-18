@@ -1,0 +1,820 @@
+---
+title: "The Campanian Ignimbrite: sites from a fuzzy-linked dataset"
+format: live-html
+engine: knitr
+resources:
+  - campanian-ignimbrite_sites.ttl
+pyodide:
+  packages:
+    - pandas
+    - matplotlib
+---
+
+{{< include ../_extensions/r-wasm/live/_knitr.qmd >}}
+
+This browser-executable notebook reads a local **Turtle (RDF) file**
+into the Pyodide virtual file system, queries it with SPARQL directly
+from Python via `rdflib`, and derives several complementary views on
+the same dataset — the Campanian Ignimbrite findspot catalogue
+maintained by the [Research Squirrel
+Engineers](https://github.com/Research-Squirrel-Engineers/campanian-ignimbrite-geo).
+
+::: {.callout-note}
+On first load, your browser downloads the Python runtime (Pyodide, ~10 MB)
+and the TTL file is copied into Pyodide's virtual filesystem.
+Please allow a moment for it to initialise.
+:::
+
+## About this notebook
+
+The Campanian Ignimbrite (CI) is one of the largest volcanic eruptions
+of the late Quaternary: around 39 000 years ago, a supereruption in
+the Campanian Volcanic Arc deposited an ash layer reaching as far as
+the Black Sea. Archaeological and palaeoenvironmental findspots across
+Europe and the Mediterranean can be correlated to this single
+stratigraphic marker, giving late Palaeolithic research an unusually
+precise temporal anchor. The dataset used here catalogues 74 such
+findspots with literature references, geolocations, and links to
+external LOD hubs (Wikidata, OpenStreetMap, GeoNames).
+
+This notebook intentionally uses a single SPARQL query to extract the
+core tabular view of the data, then derives **four complementary
+visualisations** from that one DataFrame. It is a pattern worth
+recognising: many "dashboard"-style analyses in linked data are not
+about writing more queries, but about asking different questions of
+the same result.
+
+A companion local notebook, `local_ttl-campanian-ignimbrite-sites.ipynb`,
+runs the same pipeline with the full scientific Python stack for
+readers who prefer a Jupyter environment.
+
+### Why this dataset?
+
+Three properties make the CI catalogue pedagogically valuable:
+
+- **Mixed spatial types** — caves, lakes, maars, inhabited places,
+  plateaus, and several "unknown-category" entries coexist, so
+  filtering and faceting have real visual payoff
+- **Explicit uncertainty** — every site carries a `certaintyLevel`
+  (`high`, `medium`, `low`, `dubious`, `representative`), which lets
+  us show FAIR-compatible handling of provenance and confidence
+- **Partial LOD coverage** — roughly 60 % of sites have Wikidata
+  links and 40 % have OSM links; the completeness question becomes
+  itself a research question
+
+### What you'll learn
+
+- how to load a Turtle file directly in the browser and query it with
+  `rdflib`, bypassing any SPARQL endpoint
+- how to distinguish between different kinds of skos/fsl matches
+  (`closeMatch`, `partlyMatch`, `spatialCloseMatch`, `dubiousMatch`)
+  and why the distinction matters epistemically
+- how to produce several focused views from a single, deliberate query
+
+### Data-context notes
+
+- 74 unique sites, returned as ~106 rows — sites with multiple
+  literature references are duplicated in the main query; we
+  de-duplicate for the map and keep the reference list per site
+- WKT literals come with an SRID prefix:
+  `<http://.../EPSG/0/4326> POINT(lon lat)` — the case-insensitive
+  regex parser in use handles the prefix transparently
+- external LOD links live across four properties with different
+  semantic strength: `skos:closeMatch` (most confident, 51 of 74
+  sites), `fsl:partlyMatch`, `fsl:spatialCloseMatch`, and
+  `fsl:dubiousMatch` (explicitly marked unreliable)
+- `UnknownCategory` and `InhabitedPlace` dominate the spatial types;
+  together they account for roughly half of the catalogue
+
+### Tooling notes
+
+All querying is local — `rdflib` parses the Turtle file that
+`quarto-live` copies into Pyodide's virtual filesystem via the
+`resources:` frontmatter entry. No HTTP, no CORS, no endpoint
+uptime questions. Mapping uses a hand-rolled Leaflet block returned
+via `_repr_html_`; static charts use `matplotlib`.
+
+## Step 1 — Load the Turtle file and define the SPARQL queries
+
+The TTL file is shipped alongside the notebook and copied into the
+browser's Pyodide VFS by `quarto-live`. `rdflib` then parses it into
+a `Graph` object, against which we can run arbitrary SPARQL. Two
+queries this time: one for the main tabular view (the one proposed
+in the task), and a second one collecting external LOD links across
+four different match properties.
+
+```{pyodide}
+#| label: setup
+#| autorun: false
+import micropip
+await micropip.install("rdflib")
+
+import re
+import pandas as pd
+from pathlib import Path
+import rdflib
+
+TTL_FILE = "campanian-ignimbrite_sites.ttl"
+
+# Main query — one row per (site, reference) pair
+QUERY_MAIN = """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX fsl:  <http://fuzzy-sl.squirrel.link/ontology/>
+PREFIX geo:  <http://www.opengis.net/ont/geosparql#>
+SELECT ?item ?geo ?label ?ref ?spatialType ?certainty {
+  ?item a fsl:Site .
+  ?item rdfs:label ?label .
+  ?item fsl:hasReference ?ref .
+  ?item fsl:spatialType ?spatialType .
+  ?item fsl:certaintyLevel ?certainty .
+  ?item geo:hasGeometry ?item_geom .
+  ?item_geom geo:asWKT ?geo .
+}
+"""
+
+# Matches query — one row per (site, match-property, target)
+# A UNION surfaces the four kinds of "match" with a discriminator,
+# so the popup can report not just the link but how confident the
+# modeller was about it.
+QUERY_MATCHES = """
+PREFIX fsl:  <http://fuzzy-sl.squirrel.link/ontology/>
+PREFIX skos: <http://www.w3.org/2004/02/skos/core#>
+SELECT ?item ?matchType ?target {
+  {
+    ?item a fsl:Site ; skos:closeMatch ?target .
+    BIND("closeMatch" AS ?matchType)
+  } UNION {
+    ?item a fsl:Site ; fsl:partlyMatch ?target .
+    BIND("partlyMatch" AS ?matchType)
+  } UNION {
+    ?item a fsl:Site ; fsl:spatialCloseMatch ?target .
+    BIND("spatialCloseMatch" AS ?matchType)
+  } UNION {
+    ?item a fsl:Site ; fsl:dubiousMatch ?target .
+    BIND("dubiousMatch" AS ?matchType)
+  }
+}
+"""
+
+# Case-insensitive WKT parser — handles the EPSG-prefixed literal
+# e.g. "<http://.../EPSG/0/4326> POINT(14.36 40.95)" and also bare
+# POINT(...) from other endpoints.
+_WKT_POINT_RE = re.compile(r"point\s*\(\s*([-+\d.eE]+)\s+([-+\d.eE]+)\s*\)",
+                           re.IGNORECASE)
+
+def parse_wkt_point(wkt):
+    """Return (lat, lon) or (None, None)."""
+    if not wkt:
+        return (None, None)
+    m = _WKT_POINT_RE.search(str(wkt))
+    if not m:
+        return (None, None)
+    try:
+        lon, lat = float(m.group(1)), float(m.group(2))
+        return (lat, lon)
+    except ValueError:
+        return (None, None)
+
+# Load the TTL file into an rdflib graph, once.
+g = rdflib.Graph()
+g.parse(TTL_FILE, format="turtle")
+
+print(f"✓ Loaded graph with {len(g)} triples from {TTL_FILE}")
+print("✓ Helpers defined. Run the next cell to execute the queries.")
+```
+
+## Step 2 — Run the queries, build DataFrames
+
+The main query is flattened into a row-per-reference DataFrame; for
+mapping we also build a de-duplicated one-row-per-site DataFrame with
+references aggregated into a list. The matches query is pivoted into
+per-site lists of Wikidata and OSM links.
+
+```{pyodide}
+#| label: load-data
+#| autorun: false
+assert 'g' in dir(), "⚠ Run the setup cell first."
+
+def short_id(iri):
+    """Short label like 'cisite_5' for a full IRI."""
+    s = str(iri)
+    return s.rsplit("/", 1)[-1] if "/" in s else s
+
+# --- main query → df_long (one row per reference) → df_sites (per site)
+rows = []
+for r in g.query(QUERY_MAIN):
+    lat, lon = parse_wkt_point(r["geo"])
+    rows.append({
+        "item": str(r["item"]),
+        "site_id": short_id(r["item"]),
+        "label": str(r["label"]),
+        "ref": str(r["ref"]),
+        "spatialType": short_id(r["spatialType"]),
+        "certainty": short_id(r["certainty"]),
+        "latitude": lat,
+        "longitude": lon,
+    })
+df_long = pd.DataFrame(rows).dropna(subset=["latitude", "longitude"])
+
+# One row per site, refs collapsed to a sorted list
+df_sites = (df_long
+    .groupby("item", as_index=False)
+    .agg(
+        site_id=("site_id", "first"),
+        label=("label", "first"),
+        spatialType=("spatialType", "first"),
+        certainty=("certainty", "first"),
+        latitude=("latitude", "first"),
+        longitude=("longitude", "first"),
+        refs=("ref", lambda s: sorted(set(s))),
+    )
+)
+
+# --- matches query → per-site lists of wikidata / osm links
+match_rows = []
+for r in g.query(QUERY_MATCHES):
+    target = str(r["target"])
+    match_rows.append({
+        "item": str(r["item"]),
+        "matchType": str(r["matchType"]),
+        "target": target,
+        "host": "wikidata" if "wikidata.org" in target
+                else "osm" if "openstreetmap.org" in target
+                else "geonames" if "geonames.org" in target
+                else "other",
+    })
+df_matches = pd.DataFrame(match_rows)
+
+# Aggregate per site — lists of (matchType, url) tuples for wd / osm
+def collect(group, host):
+    sub = group[group["host"] == host]
+    return [(row["matchType"], row["target"]) for _, row in sub.iterrows()]
+
+if not df_matches.empty:
+    wd_links = (df_matches.groupby("item")
+                .apply(lambda g: collect(g, "wikidata"), include_groups=False)
+                .rename("wikidata_links"))
+    osm_links = (df_matches.groupby("item")
+                 .apply(lambda g: collect(g, "osm"), include_groups=False)
+                 .rename("osm_links"))
+    df_sites = df_sites.merge(wd_links, left_on="item", right_index=True, how="left")
+    df_sites = df_sites.merge(osm_links, left_on="item", right_index=True, how="left")
+else:
+    df_sites["wikidata_links"] = [[] for _ in range(len(df_sites))]
+    df_sites["osm_links"] = [[] for _ in range(len(df_sites))]
+
+# Normalise NaN → empty list for easier downstream handling
+df_sites["wikidata_links"] = df_sites["wikidata_links"].apply(
+    lambda v: v if isinstance(v, list) else []
+)
+df_sites["osm_links"] = df_sites["osm_links"].apply(
+    lambda v: v if isinstance(v, list) else []
+)
+
+df_sites["has_wikidata"] = df_sites["wikidata_links"].apply(len) > 0
+df_sites["has_osm"] = df_sites["osm_links"].apply(len) > 0
+
+print(f"{len(df_sites)} unique sites, "
+      f"{len(df_long)} site-reference rows, "
+      f"{len(df_matches)} match triples")
+print(f"Sites with Wikidata link : {df_sites['has_wikidata'].sum():2d} "
+      f"({100 * df_sites['has_wikidata'].mean():.0f}%)")
+print(f"Sites with OSM link      : {df_sites['has_osm'].sum():2d} "
+      f"({100 * df_sites['has_osm'].mean():.0f}%)")
+df_sites.head(5)
+```
+
+## Step 3a — Distribution of spatial types
+
+The catalogue mixes quite different place concepts. Before looking at
+the map, a horizontal bar chart of spatial-type counts gives the
+numerical ground truth for what will follow — in particular it makes
+clear how much of the data sits in two loose categories
+(`UnknownCategory` and `InhabitedPlace`).
+
+```{pyodide}
+#| label: chart-spatial-types
+#| autorun: false
+assert 'df_sites' in dir() and not df_sites.empty, "⚠ Run the previous cells first."
+
+import matplotlib.pyplot as plt
+
+counts = df_sites["spatialType"].value_counts().sort_values(ascending=True)
+
+fig, ax = plt.subplots(figsize=(8, max(3, 0.4 * len(counts))))
+ax.barh(counts.index, counts.values, color="#4c72b0")
+ax.set_xlabel("Number of sites")
+ax.set_title("Campanian Ignimbrite findspots by spatial type")
+for i, v in enumerate(counts.values):
+    ax.text(v + 0.3, i, str(int(v)), va="center")
+plt.tight_layout()
+plt.show()
+```
+
+## Step 3b — Map 1: findspots coloured by spatial type
+
+Each site appears once, coloured by `spatialType`, with one toggleable
+layer per category. The layer control doubles as a colour legend.
+Popups include the full list of literature references for the site
+and any Wikidata or OSM links, grouped by match confidence
+(`closeMatch` is the strongest, `dubiousMatch` the weakest).
+
+```{pyodide}
+#| label: map-spatialtype
+#| autorun: false
+assert 'df_sites' in dir() and not df_sites.empty, "⚠ Run the previous cells first."
+
+import json, uuid
+
+PALETTE = [
+    "#e6194B", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
+    "#42d4f4", "#f032e6", "#469990", "#9A6324", "#800000",
+    "#808000", "#000075", "#e91e63", "#607d8b", "#795548",
+]
+stypes = sorted(df_sites["spatialType"].unique())
+stype_colors = {t: PALETTE[i % len(PALETTE)] for i, t in enumerate(stypes)}
+
+def build_popup_html(row):
+    refs_html = "<br>".join(f"• {r}" for r in row["refs"]) or "<i>(no reference)</i>"
+    parts = [
+        f"<b>{row['label']}</b>",
+        f"<i>{row['spatialType']}</i> — certainty: <b>{row['certainty']}</b>",
+        "<hr style='margin:4px 0'>",
+        f"<div style='font-size:12px'><b>References ({len(row['refs'])})</b><br>{refs_html}</div>",
+    ]
+    if row["wikidata_links"]:
+        items = "<br>".join(
+            f'<a href="{u}" target="_blank" rel="noopener">{u.rsplit("/", 1)[-1]}</a> '
+            f'<span style="color:#888;font-size:11px">({mt})</span>'
+            for mt, u in row["wikidata_links"]
+        )
+        parts.append(f"<div style='font-size:12px;margin-top:4px'><b>Wikidata</b><br>{items}</div>")
+    if row["osm_links"]:
+        items = "<br>".join(
+            f'<a href="{u}" target="_blank" rel="noopener">{u.rsplit("/", 2)[-2]}/{u.rsplit("/", 1)[-1]}</a> '
+            f'<span style="color:#888;font-size:11px">({mt})</span>'
+            for mt, u in row["osm_links"]
+        )
+        parts.append(f"<div style='font-size:12px;margin-top:4px'><b>OpenStreetMap</b><br>{items}</div>")
+    return "".join(parts)
+
+markers = [
+    {
+        "lat": float(row["latitude"]),
+        "lon": float(row["longitude"]),
+        "spatialType": row["spatialType"],
+        "color": stype_colors[row["spatialType"]],
+        "popup": build_popup_html(row),
+    }
+    for _, row in df_sites.iterrows()
+]
+stype_list = [{"stype": t, "color": stype_colors[t]} for t in stypes]
+payload = json.dumps({"markers": markers, "stypes": stype_list})
+
+lat_c = float(df_sites["latitude"].mean())
+lon_c = float(df_sites["longitude"].mean())
+
+map_id = f"ci-stype-{uuid.uuid4().hex[:8]}"
+data_var = f"__mapData_{map_id.replace('-', '_')}"
+
+html = f"""
+<div id="{map_id}" style="height:560px;width:100%;border:1px solid #ddd;border-radius:4px"></div>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.css" />
+<script>window["{data_var}"] = {payload};</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+    const mapId = "{map_id}";
+    const data = window["{data_var}"];
+    const centreLat = {lat_c};
+    const centreLon = {lon_c};
+
+    function loadFullscreen(cb) {{
+        if (typeof L !== 'undefined' && L.control && L.control.fullscreen) return cb();
+        if (typeof L === 'undefined') return setTimeout(() => loadFullscreen(cb), 50);
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.js';
+        s.onload = cb;
+        document.head.appendChild(s);
+    }}
+
+    let attempts = 0;
+    function init() {{
+        const el = document.getElementById(mapId);
+        if (!el || typeof L === 'undefined') return setTimeout(init, 50);
+        if (el._leaflet_id) return;
+        const hasFullscreen = !!(L.control && L.control.fullscreen);
+        if (!hasFullscreen && attempts < 40) {{ attempts++; return setTimeout(init, 50); }}
+
+        const osm = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }});
+        const osmHOT = L.tileLayer('https://{{s}}.tile.openstreetmap.fr/hot/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; OpenStreetMap contributors, Tiles style by Humanitarian OpenStreetMap Team'
+        }});
+        const esriImagery = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 18,
+            attribution: 'Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics'
+        }});
+        const esriTerrain = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 13,
+            attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA, DeLorme, and NPS'
+        }});
+
+        const stypeLayers = {{}};
+        for (const s of data.stypes) stypeLayers[s.stype] = L.layerGroup();
+        for (const m of data.markers) {{
+            L.circleMarker([m.lat, m.lon], {{
+                radius: 6, color: m.color, weight: 1,
+                fillColor: m.color, fillOpacity: 0.8
+            }}).bindPopup(m.popup, {{ maxWidth: 340 }}).addTo(stypeLayers[m.spatialType]);
+        }}
+
+        const initialLayers = [osm];
+        const overlays = {{}};
+        for (const s of data.stypes) {{
+            initialLayers.push(stypeLayers[s.stype]);
+            const sw = '<span style="display:inline-block;width:10px;height:10px;'
+                + 'background:' + s.color + ';border-radius:50%;'
+                + 'margin-right:6px;vertical-align:middle"></span>';
+            overlays[sw + s.stype] = stypeLayers[s.stype];
+        }}
+
+        const mapOpts = {{ center: [centreLat, centreLon], zoom: 5, layers: initialLayers }};
+        if (hasFullscreen) {{
+            mapOpts.fullscreenControl = true;
+            mapOpts.fullscreenControlOptions = {{ position: 'topleft' }};
+        }}
+        const map = L.map(mapId, mapOpts);
+        L.control.layers(
+            {{
+                "OpenStreetMap": osm,
+                "OpenStreetMap.HOT": osmHOT,
+                "Esri.WorldImagery": esriImagery,
+                "Esri.WorldTerrain": esriTerrain,
+            }},
+            overlays,
+            {{ collapsed: true }}
+        ).addTo(map);
+
+        setTimeout(() => map.invalidateSize(), 200);
+    }}
+
+    loadFullscreen(init);
+}})();
+</script>
+"""
+
+class _Html:
+    def __init__(self, s): self._s = s
+    def _repr_html_(self): return self._s
+_Html(html)
+```
+
+## Step 3c — Reference frequencies
+
+Which publications underpin the catalogue? A horizontal bar chart of
+the top 15 literature references shows how dependent the dataset is
+on a small number of papers: Rosi et al. 1999 alone supplies roughly
+20 % of the site entries. This is a useful reminder that the shape of
+a linked-data resource often mirrors the shape of its bibliography.
+
+```{pyodide}
+#| label: chart-references
+#| autorun: false
+assert 'df_long' in dir() and not df_long.empty, "⚠ Run the previous cells first."
+
+ref_counts = df_long["ref"].value_counts().head(15).sort_values(ascending=True)
+
+fig, ax = plt.subplots(figsize=(9, max(3, 0.4 * len(ref_counts))))
+ax.barh(ref_counts.index, ref_counts.values, color="#8172b2")
+ax.set_xlabel("Number of site entries")
+ax.set_title(f"Top 15 references (of {df_long['ref'].nunique()} total) in the CI catalogue")
+for i, v in enumerate(ref_counts.values):
+    ax.text(v + 0.1, i, str(int(v)), va="center")
+plt.tight_layout()
+plt.show()
+```
+
+## Step 3d — Map 2: findspots coloured by certainty level
+
+Each site is drawn once again, this time coloured by
+`certaintyLevel`: green (`high`), yellow (`medium`), orange (`low`),
+red (`dubious`), grey (`representative`). The same popups as in
+Map 1 are reused. This view is didactically the most pointed one —
+it makes the completeness and reliability distribution of the dataset
+part of the reading experience.
+
+```{pyodide}
+#| label: map-certainty
+#| autorun: false
+assert 'df_sites' in dir() and not df_sites.empty, "⚠ Run the previous cells first."
+
+import json, uuid
+
+CERTAINTY_COLORS = {
+    "high":          "#2e7d32",
+    "medium":        "#f9a825",
+    "low":           "#ef6c00",
+    "dubious":       "#c62828",
+    "representative": "#616161",
+}
+# Present keys only, in a sensible display order
+ORDER = ["high", "medium", "low", "dubious", "representative"]
+cert_levels = [c for c in ORDER if c in df_sites["certainty"].unique()]
+
+markers = [
+    {
+        "lat": float(row["latitude"]),
+        "lon": float(row["longitude"]),
+        "certainty": row["certainty"],
+        "color": CERTAINTY_COLORS.get(row["certainty"], "#888"),
+        "popup": build_popup_html(row),
+    }
+    for _, row in df_sites.iterrows()
+]
+cert_list = [
+    {"cert": c,
+     "color": CERTAINTY_COLORS.get(c, "#888"),
+     "n": int((df_sites["certainty"] == c).sum())}
+    for c in cert_levels
+]
+payload = json.dumps({"markers": markers, "certs": cert_list})
+
+lat_c = float(df_sites["latitude"].mean())
+lon_c = float(df_sites["longitude"].mean())
+
+map_id = f"ci-cert-{uuid.uuid4().hex[:8]}"
+data_var = f"__mapData_{map_id.replace('-', '_')}"
+
+html = f"""
+<div id="{map_id}" style="height:560px;width:100%;border:1px solid #ddd;border-radius:4px"></div>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.css" />
+<script>window["{data_var}"] = {payload};</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+    const mapId = "{map_id}";
+    const data = window["{data_var}"];
+    const centreLat = {lat_c};
+    const centreLon = {lon_c};
+
+    function loadFullscreen(cb) {{
+        if (typeof L !== 'undefined' && L.control && L.control.fullscreen) return cb();
+        if (typeof L === 'undefined') return setTimeout(() => loadFullscreen(cb), 50);
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.js';
+        s.onload = cb;
+        document.head.appendChild(s);
+    }}
+
+    let attempts = 0;
+    function init() {{
+        const el = document.getElementById(mapId);
+        if (!el || typeof L === 'undefined') return setTimeout(init, 50);
+        if (el._leaflet_id) return;
+        const hasFullscreen = !!(L.control && L.control.fullscreen);
+        if (!hasFullscreen && attempts < 40) {{ attempts++; return setTimeout(init, 50); }}
+
+        const osm = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }});
+        const osmHOT = L.tileLayer('https://{{s}}.tile.openstreetmap.fr/hot/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; OpenStreetMap contributors, Tiles style by Humanitarian OpenStreetMap Team'
+        }});
+        const esriImagery = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 18,
+            attribution: 'Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics'
+        }});
+        const esriTerrain = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 13,
+            attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA, DeLorme, and NPS'
+        }});
+
+        const certLayers = {{}};
+        for (const c of data.certs) certLayers[c.cert] = L.layerGroup();
+        for (const m of data.markers) {{
+            L.circleMarker([m.lat, m.lon], {{
+                radius: 6, color: m.color, weight: 1,
+                fillColor: m.color, fillOpacity: 0.8
+            }}).bindPopup(m.popup, {{ maxWidth: 340 }}).addTo(certLayers[m.certainty]);
+        }}
+
+        const initialLayers = [osm];
+        const overlays = {{}};
+        for (const c of data.certs) {{
+            initialLayers.push(certLayers[c.cert]);
+            const sw = '<span style="display:inline-block;width:10px;height:10px;'
+                + 'background:' + c.color + ';border-radius:50%;'
+                + 'margin-right:6px;vertical-align:middle"></span>';
+            overlays[sw + c.cert + ' (' + c.n + ')'] = certLayers[c.cert];
+        }}
+
+        const mapOpts = {{ center: [centreLat, centreLon], zoom: 5, layers: initialLayers }};
+        if (hasFullscreen) {{
+            mapOpts.fullscreenControl = true;
+            mapOpts.fullscreenControlOptions = {{ position: 'topleft' }};
+        }}
+        const map = L.map(mapId, mapOpts);
+        L.control.layers(
+            {{
+                "OpenStreetMap": osm,
+                "OpenStreetMap.HOT": osmHOT,
+                "Esri.WorldImagery": esriImagery,
+                "Esri.WorldTerrain": esriTerrain,
+            }},
+            overlays,
+            {{ collapsed: true }}
+        ).addTo(map);
+
+        setTimeout(() => map.invalidateSize(), 200);
+    }}
+
+    loadFullscreen(init);
+}})();
+</script>
+"""
+
+_Html(html)
+```
+
+## Step 3e — Map 3: archaeological findspots (caves and archaeological sites)
+
+A narrower view, filtered to just the two spatial types with the most
+direct archaeological interpretation: `Cave` (9 sites) and
+`ArchaeologicalSite` (3 sites) — together 12 of the 74 catalogue
+entries. This is the Campanian-Ignimbrite analogue of the QGIS
+workflow "filter the SPARQL query by a particular spatial type";
+here we do it in pandas after the fact. The two categories are kept
+as separate layers so they can be toggled independently.
+
+```{pyodide}
+#| label: map-archaeological
+#| autorun: false
+assert 'df_sites' in dir() and not df_sites.empty, "⚠ Run the previous cells first."
+
+import json, uuid
+
+ARCH_TYPES = ["Cave", "ArchaeologicalSite"]
+ARCH_COLORS = {"Cave": "#1976d2", "ArchaeologicalSite": "#d84315"}
+
+df_arch = df_sites[df_sites["spatialType"].isin(ARCH_TYPES)].copy()
+print(f"Showing {len(df_arch)} archaeological findspots "
+      f"({(df_arch['spatialType'] == 'Cave').sum()} Cave, "
+      f"{(df_arch['spatialType'] == 'ArchaeologicalSite').sum()} ArchaeologicalSite)")
+
+markers = [
+    {
+        "lat": float(row["latitude"]),
+        "lon": float(row["longitude"]),
+        "spatialType": row["spatialType"],
+        "color": ARCH_COLORS[row["spatialType"]],
+        "popup": build_popup_html(row),
+    }
+    for _, row in df_arch.iterrows()
+]
+type_list = [
+    {"stype": t,
+     "color": ARCH_COLORS[t],
+     "n": int((df_arch["spatialType"] == t).sum())}
+    for t in ARCH_TYPES if (df_arch["spatialType"] == t).any()
+]
+payload = json.dumps({"markers": markers, "stypes": type_list})
+
+lat_c = float(df_arch["latitude"].mean()) if not df_arch.empty else 42.0
+lon_c = float(df_arch["longitude"].mean()) if not df_arch.empty else 14.0
+
+map_id = f"ci-arch-{uuid.uuid4().hex[:8]}"
+data_var = f"__mapData_{map_id.replace('-', '_')}"
+
+html = f"""
+<div id="{map_id}" style="height:560px;width:100%;border:1px solid #ddd;border-radius:4px"></div>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.css" />
+<script>window["{data_var}"] = {payload};</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+    const mapId = "{map_id}";
+    const data = window["{data_var}"];
+    const centreLat = {lat_c};
+    const centreLon = {lon_c};
+
+    function loadFullscreen(cb) {{
+        if (typeof L !== 'undefined' && L.control && L.control.fullscreen) return cb();
+        if (typeof L === 'undefined') return setTimeout(() => loadFullscreen(cb), 50);
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.js';
+        s.onload = cb;
+        document.head.appendChild(s);
+    }}
+
+    let attempts = 0;
+    function init() {{
+        const el = document.getElementById(mapId);
+        if (!el || typeof L === 'undefined') return setTimeout(init, 50);
+        if (el._leaflet_id) return;
+        const hasFullscreen = !!(L.control && L.control.fullscreen);
+        if (!hasFullscreen && attempts < 40) {{ attempts++; return setTimeout(init, 50); }}
+
+        const osm = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }});
+        const osmHOT = L.tileLayer('https://{{s}}.tile.openstreetmap.fr/hot/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; OpenStreetMap contributors, Tiles style by Humanitarian OpenStreetMap Team'
+        }});
+        const esriImagery = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 18,
+            attribution: 'Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics'
+        }});
+        const esriTerrain = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 13,
+            attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA, DeLorme, and NPS'
+        }});
+
+        const typeLayers = {{}};
+        for (const s of data.stypes) typeLayers[s.stype] = L.layerGroup();
+        for (const m of data.markers) {{
+            L.circleMarker([m.lat, m.lon], {{
+                radius: 8, color: m.color, weight: 2,
+                fillColor: m.color, fillOpacity: 0.75
+            }}).bindPopup(m.popup, {{ maxWidth: 340 }}).addTo(typeLayers[m.spatialType]);
+        }}
+
+        const initialLayers = [osm];
+        const overlays = {{}};
+        for (const s of data.stypes) {{
+            initialLayers.push(typeLayers[s.stype]);
+            const sw = '<span style="display:inline-block;width:10px;height:10px;'
+                + 'background:' + s.color + ';border-radius:50%;'
+                + 'margin-right:6px;vertical-align:middle"></span>';
+            overlays[sw + s.stype + ' (' + s.n + ')'] = typeLayers[s.stype];
+        }}
+
+        const mapOpts = {{ center: [centreLat, centreLon], zoom: 5, layers: initialLayers }};
+        if (hasFullscreen) {{
+            mapOpts.fullscreenControl = true;
+            mapOpts.fullscreenControlOptions = {{ position: 'topleft' }};
+        }}
+        const map = L.map(mapId, mapOpts);
+        L.control.layers(
+            {{
+                "OpenStreetMap": osm,
+                "OpenStreetMap.HOT": osmHOT,
+                "Esri.WorldImagery": esriImagery,
+                "Esri.WorldTerrain": esriTerrain,
+            }},
+            overlays,
+            {{ collapsed: true }}
+        ).addTo(map);
+
+        setTimeout(() => map.invalidateSize(), 200);
+    }}
+
+    loadFullscreen(init);
+}})();
+</script>
+"""
+
+_Html(html)
+```
+
+## Step 4 — Explore
+
+`df_sites` (one row per site) and `df_long` (one row per reference)
+stay in scope, as does `df_matches`. Change the cell below to filter,
+aggregate, or ask your own question of the data.
+
+```{pyodide}
+#| label: explore
+#| autorun: false
+assert 'df_sites' in dir(), "⚠ Run the previous cells first."
+
+# Hier anpassen: show dubious-certainty sites; filter by spatial type;
+# list sites without any Wikidata link; …
+df_sites[df_sites["certainty"].isin(["low", "dubious"])] \
+    [["site_id", "label", "spatialType", "certainty", "refs"]] \
+    .reset_index(drop=True)
+```
+
+---
+
+*Part of an Open Educational Resource series on knowledge graphs and
+linked open data, produced in the context of
+[NFDI4Objects](https://www.nfdi4objects.net/). Dataset by the
+[Research Squirrel Engineers](https://research-squirrel-engineers.github.io/)
+under CC BY 4.0.*

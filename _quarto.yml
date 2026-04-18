@@ -29,6 +29,8 @@ website:
             href: notebooks_lod/n4okg-samian-discovery-sites-live.qmd
           - text: "NFDI4Objects KG Samian Potter activity"
             href: notebooks_lod/n4okg-samian-potter-activity-live.qmd
+          - text: "Local TTL-File Campanian Ignimbrite Sites"
+            href: notebooks_lod/local_ttl-campanian-ignimbrite-sites-live.qmd
       - text: "Jupyter Notebooks: AMT"
         menu:
           - text: "AMT – Academic Meta Tool (interaktiv)"
