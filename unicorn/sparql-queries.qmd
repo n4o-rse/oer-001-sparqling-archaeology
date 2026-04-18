@@ -22,69 +22,51 @@ auto-detected and the results are rendered as a QGIS vector layer.
 
 **Endpoint:** `https://query.wikidata.org/sparql`
 
-The classical SPARQL Unicorn worked example (Schmidt & Thiery 2022):
-all instances of *Ogham stone* (`wd:Q1865081`) whose find-spot lies on
-the Dingle peninsula. The query demonstrates two patterns that recur
-throughout this page: fetching a coordinate via `wdt:P625` (which the
-Unicorn plugin auto-converts to a GeoSPARQL WKT point) and restricting
-results by a transitive *located-in* chain (`wdt:P131*`) rather than
-an exact match.
+A worked example from the Linked Open Ogham project (Schmidt & Thiery
+2022): all CIIC-catalogued Ogham stones (`wd:Q72617071`) that are
+*part of* the Corpus Inscriptionum Insularum Celticarum
+(`wdt:P361 wd:Q100530634`) and administratively located on the
+Dingle peninsula (`wdt:P131 wd:Q59419929`). The `SERVICE wikibase:label`
+block adds a localised `?itemLabel` automatically — a Wikibase-specific
+convenience that saves an explicit `rdfs:label` triple with a language
+filter.
 
 ![](unicorn_wikidata_ogham_dingle.png)
 
 ```sparql
-PREFIX wd: <http://www.wikidata.org/entity/>
-PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-
-SELECT DISTINCT ?stone ?stoneLabel ?geo WHERE {
-  ?stone wdt:P31 wd:Q1865081 ;           # instance of: Ogham stone
-         wdt:P189 ?findspot ;            # located on terrain feature
-         rdfs:label ?stoneLabel ;
-         wdt:P625 ?geo .
-  ?findspot wdt:P131* wd:Q1426863 .      # admin entity: Dingle peninsula
-  FILTER(LANG(?stoneLabel) = "en")
+SELECT ?item ?itemLabel ?geo WHERE {
+  ?item wdt:P31 wd:Q72617071;
+    wdt:P361 wd:Q100530634;
+    wdt:P625 ?geo;
+    wdt:P131 wd:Q59419929.
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }
 }
 ```
 
-## Wikidata — Holy Wells in Ireland and the UK
+## Wikidata — Holy Wells in Ireland
 
 **Endpoint:** `https://query.wikidata.org/sparql`
 
-The second Wikidata example queries Holy Wells curated as part of the
-Research Squirrel Engineers' *WikiProject HolyWells*. It returns every
-item typed as *Holy Well* (`wd:Q1371047`) from Ireland (`wd:Q27`) or
-the UK (`wd:Q145`), named after a male saint, with the saint's label
-used as the `?layer` variable — which the Unicorn plugin picks up as
-a categorical layer name in QGIS. Swap `wd:Q6581072` in for the
-`wdt:P21` value to flip to female saints.
+The second Wikidata example queries Holy Wells curated by the Research
+Squirrel Engineers' *WikiProject HolyWells*. It returns every item
+typed as *Holy Well* (`wd:Q1371047`) located in Ireland (`wd:Q27`) and
+named after a female saint (`wdt:P21 wd:Q6581072`) — swap in
+`wd:Q6581097` to flip to male saints. The result is ordered by
+`?namedAfterLabel`, which groups stones by their patron saint in the
+QGIS attribute table.
 
 ![](unicorn_wikidata_holywells.png)
 
 ```sparql
-PREFIX wd: <http://www.wikidata.org/entity/>
-PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-
-SELECT DISTINCT ?item ?itemLabel ?namedAfter ?namedAfterLabel
-                ?geo ?layer
-WHERE {
-  ?item wdt:P31 wd:Q1371047 ;           # instance of: Holy Well
-        wdt:P625 ?geo ;                 # coordinate location
-        wdt:P138 ?namedAfter ;          # named after
-        wdt:P17 ?country .
-  VALUES ?country {
-    wd:Q27                              # Ireland
-    wd:Q145                             # United Kingdom
-  }
-  ?namedAfter wdt:P21 wd:Q6581097 ;     # sex: male  (female = Q6581072)
-              rdfs:label ?layer .
-  FILTER(LANG(?layer) = "en")
-  SERVICE wikibase:label {
-    bd:serviceParam wikibase:language "en"
-  }
+SELECT DISTINCT ?item ?itemLabel ?namedAfter ?namedAfterLabel ?geo WHERE {
+  ?item wdt:P31 wd:Q1371047;
+    wdt:P625 ?geo;
+    wdt:P138 ?namedAfter;
+    wdt:P17 wd:Q27.
+  ?namedAfter wdt:P21 wd:Q6581072.
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
 }
-ORDER BY ?layer ?itemLabel
+ORDER BY (?namedAfterLabel)
 ```
 
 ## FactGrid — historical sites in Koblenz
@@ -102,13 +84,10 @@ be used to colour the resulting points in QGIS by category.
 ![](unicorn_factgrid_koblenz.png)
 
 ```sparql
-PREFIX wd: <http://www.wikidata.org/entity/>
-PREFIX wdt: <https://database.factgrid.de/prop/direct/>
-
 SELECT ?item ?itemLabel ?geo ?layerLabel WHERE {
-  ?item wdt:P131 wd:Q922978 .    # located in the admin entity: Koblenz
-  ?item wdt:P2 ?layer .          # instance of (type)
-  ?item wdt:P48 ?geo .           # coordinate location
+  ?item wdt:P131 wd:Q922978 . 
+  ?item wdt:P2 ?layer .
+  ?item wdt:P48 ?geo .
   SERVICE wikibase:label {
     bd:serviceParam wikibase:language "en"
   }
@@ -130,25 +109,20 @@ catalogue.
 
 A narrower query from the same *Mapping Koblenz* project: every
 pharmacy (`P280 = wd:Q480860`, *is a*: pharmacy) operated by a
-pharmacist (`P47 = wd:Q10399`) and located in Koblenz. The
-coordinate is `OPTIONAL` so that pharmacies without a geo-reference
-still appear in the result — in QGIS they are filtered out of the
-map layer automatically but remain visible in the attribute table.
+pharmacist (`P47 = wd:Q10399`) and located in Koblenz. Unlike the
+Koblenz overview above, `wdt:P48 ?geo` is mandatory here — pharmacies
+without a geo-reference are filtered out, so every row in the result
+maps to a point in QGIS.
 
 ![](unicorn_factgrid_pharmacies.png)
 
 ```sparql
-PREFIX wd: <http://www.wikidata.org/entity/>
-PREFIX wdt: <https://database.factgrid.de/prop/direct/>
-
-SELECT ?Pharmacy ?PharmacyLabel ?Coordinate_location WHERE {
-  SERVICE wikibase:label {
-    bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en"
-  }
-  ?Pharmacy wdt:P280 wd:Q480860 ;    # is a: pharmacy
-            wdt:P47 wd:Q10399 ;      # operated by: pharmacist
-            wdt:P131 wd:Q922978 .    # admin entity: Koblenz
-  OPTIONAL { ?Pharmacy wdt:P48 ?Coordinate_location . }
+SELECT ?item ?itemLabel ?geo WHERE {
+  ?item wdt:P280 wd:Q480860;
+    wdt:P47 wd:Q10399;
+    wdt:P131 wd:Q922978;
+    wdt:P48 ?geo.
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }
 }
 ```
 
@@ -168,13 +142,12 @@ geographical coverage of the vocabulary.
 ```sparql
 PREFIX nmo: <http://nomisma.org/ontology#>
 PREFIX geo: <http://www.w3.org/2003/01/geo/wgs84_pos#>
-PREFIX wgs84_pos: <http://www.w3.org/2003/01/geo/wgs84_pos#>
 
 SELECT ?item ?lat ?lon WHERE {
   ?item a nmo:Mint .
   ?item geo:location ?loc .
-  ?loc wgs84_pos:lat ?lat .
-  ?loc wgs84_pos:long ?lon .
+  ?loc geo:lat ?lat .
+  ?loc geo:long ?lon .
 }
 ```
 
@@ -187,9 +160,9 @@ contributed by partner projects (the British Museum, PAS, and others).
 It pulls numismatic objects whose findspot falls within
 Northamptonshire (`wikidata:Q23115`) via a transitive CIDOC-CRM path
 (`crm:P89_falls_within+`), together with their type series item and
-end date. Ordering by `?date` gives the chronological distribution of
-coin finds across the county — visualised in QGIS as a graduated
-symbology on the `date` field, as shown in the plugin screenshot.
+end date. The `date` field is then available in QGIS as a graduated
+symbology attribute, giving the chronological distribution of coin
+finds across the county.
 
 ![](unicorn_nomisma_northamptonshire.png)
 
@@ -208,7 +181,6 @@ SELECT ?item ?type ?date ?place ?lat ?lon WHERE {
   ?loc geo:lat ?lat ;
        geo:long ?lon .
 }
-ORDER BY ASC(?date)
 ```
 
 ## NFDI4Objects KG — Ogham stones with *MAQI* inscriptions
@@ -228,9 +200,8 @@ genealogically relevant inscriptions across Ireland.
 ```sparql
 PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX geosparql: <http://www.opengis.net/ont/geosparql#>
-PREFIX ogham: <http://ontology.ogham.link/>
-PREFIX oghamonto: <http://ontology.ogham.link/ontology/>
-
+PREFIX ogham: <http://lod.ogham.link/data/>
+PREFIX oghamonto: <http://ontology.ogham.link/>
 SELECT DISTINCT ?item ?geo ?itemLabel ?stone ?stoneLabel ?readingLabel
 WHERE {
   ?stone oghamonto:shows ogham:OW6 ;
