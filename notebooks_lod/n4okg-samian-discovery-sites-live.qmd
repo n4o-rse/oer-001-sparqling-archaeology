@@ -1,0 +1,396 @@
+---
+title: "Samian ware: discovery sites and their Pleiades links"
+format: live-html
+engine: knitr
+pyodide:
+  packages:
+    - pandas
+    - matplotlib
+---
+
+{{< include ../_extensions/r-wasm/live/_knitr.qmd >}}
+
+This browser-executable notebook queries the NFDI4Objects Knowledge Graph
+for Samian-ware **discovery sites** — places where terra sigillata has
+been found — and checks which of them are linked to
+[Pleiades](https://pleiades.stoa.org/), the gazetteer of ancient places.
+The result is visualised as a two-layer Leaflet map that makes the
+coverage of Pleiades identifiers geographically visible.
+
+::: {.callout-note}
+On first load, your browser downloads the Python runtime (Pyodide, ~10 MB).
+Please allow a moment for it to initialise.
+:::
+
+::: {.callout-warning}
+The NFDI4Objects Knowledge Graph is a research prototype. If this
+notebook fails to load data with a *network error*, the endpoint may be
+temporarily unreachable or may not allow cross-origin browser requests
+from this page's domain. The local `.ipynb` companion is not affected
+by this and is always a reliable fallback.
+:::
+
+## About this notebook
+
+Samian ware travelled widely. Finds have been recorded from Britain to
+North Africa and from the Atlantic coast to the Danube limes. The
+NFDI4Objects Knowledge Graph represents each find location as a
+`lado:DiscoverySite` with a GeoSPARQL geometry. Some — but not all —
+discovery sites additionally carry a `lado:pleiadesID` link into the
+Pleiades gazetteer, giving a stable external identifier for the
+ancient place.
+
+This notebook fetches all discovery sites together with their
+(optional) Pleiades link, summarises the coverage as a bar chart, and
+plots the sites on an interactive map that separates
+Pleiades-annotated from unannotated finds into two toggleable layers.
+A companion local notebook, `n4okg-samian-discovery-sites.ipynb`, runs
+the same pipeline against the full scientific Python stack
+(`SPARQLWrapper`, `folium`) for readers who prefer a Jupyter
+environment.
+
+### Why this dataset?
+
+The Pleiades-coverage question is a good example of a broader theme in
+linked open data: *optional* properties are where the heterogeneity
+lives. A `DiscoverySite` with a Pleiades link participates in the wider
+ancient-world LOD ecosystem; one without is effectively an island.
+Making that distinction geographically visible — rather than hiding it
+behind a single percentage figure — turns a provenance question into a
+research question about *which* regions are well connected.
+
+### What you'll learn
+
+- how `OPTIONAL` in SPARQL behaves in the result set (missing bindings,
+  not `null` columns)
+- how to compute and visualise LOD coverage as a categorical map
+- how to attach external-gazetteer links directly into marker popups
+
+### Data-context notes
+
+- one row per discovery site; the `pleiadesID` column is empty when the
+  site has no Pleiades link
+- `pleiadesID` is filtered to IRIs (`isIRI`) so that accidental string
+  values are excluded
+- coordinates come from `geosparql:hasGeometry` → `geosparql:asWKT` as
+  usual — WKT in `POINT(lon lat)` form
+- coordinate precision varies: some sites have exact locations, others
+  are geocoded to a modern settlement or province centroid, which
+  means stacked markers at e.g. a city centre are expected and not a
+  bug
+
+### Tooling notes
+
+In the browser, SPARQL access goes through `pyodide.http.pyfetch` —
+`SPARQLWrapper` is not available in Pyodide. Mapping uses a
+hand-rolled Leaflet block returned via `_repr_html_`; with 3 900-plus
+markers this is much lighter than `folium`, which would inline the
+entire marker payload into a generated HTML page.
+
+## Step 1 — Define the SPARQL query
+
+`OPTIONAL` wraps the Pleiades-link pattern, so a site without a link
+still appears in the result — just without a `pleiadesID` binding. The
+`FILTER(isIRI(?pleiadesID))` clause defends against non-IRI values
+that may slip in during cataloguing.
+
+```{pyodide}
+#| label: setup
+#| autorun: false
+from pyodide.http import pyfetch
+import urllib.parse
+import re
+import pandas as pd
+
+SPARQL_ENDPOINT = "https://graph.nfdi4objects.net/api/sparql"
+
+SPARQL_QUERY = """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX lado: <http://archaeology.link/ontology#>
+SELECT ?item ?itemLabel ?pleiadesID ?geo WHERE {
+  GRAPH <https://graph.nfdi4objects.net/collection/8> {
+    ?item a <http://archaeology.link/ontology#DiscoverySite> .
+    ?item <http://www.opengis.net/ont/geosparql#hasGeometry> ?item_geom .
+    ?item rdfs:label ?itemLabel .
+    OPTIONAL {
+      ?item lado:pleiadesID ?pleiadesID .
+      FILTER(isIRI(?pleiadesID))
+    }
+    ?item_geom <http://www.opengis.net/ont/geosparql#asWKT> ?geo .
+  }
+}
+"""
+
+async def fetch_sparql(endpoint, query):
+    # POST with form-encoded body is the SPARQL 1.1 standard transport for
+    # queries longer than typical URL limits, and more robust across
+    # endpoints than GET for queries that contain GRAPH clauses or long IRIs.
+    body = urllib.parse.urlencode({"query": query})
+    response = await pyfetch(
+        endpoint,
+        method="POST",
+        headers={
+            "Accept": "application/sparql-results+json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body=body,
+    )
+    data = await response.json()
+    return data["results"]["bindings"]
+
+print("✓ Helpers defined. Run the next cell to load the data.")
+```
+
+## Step 2 — Load the data
+
+A missing `OPTIONAL` variable is simply absent from the bindings
+dictionary — we use `.get()` to turn that into `None` in the DataFrame.
+A derived boolean column `has_pleiades` makes subsequent analysis easy.
+
+```{pyodide}
+#| label: load-data
+#| autorun: false
+_WKT_POINT_RE = re.compile(r"point\s*\(\s*([-+\d.eE]+)\s+([-+\d.eE]+)\s*\)",
+                           re.IGNORECASE)
+
+def parse_wkt_point(wkt):
+    if not wkt:
+        return (None, None)
+    m = _WKT_POINT_RE.search(wkt)
+    if not m:
+        return (None, None)
+    try:
+        lon, lat = float(m.group(1)), float(m.group(2))
+        return (lat, lon)
+    except ValueError:
+        return (None, None)
+
+bindings = await fetch_sparql(SPARQL_ENDPOINT, SPARQL_QUERY)
+
+rows = []
+for b in bindings:
+    lat, lon = parse_wkt_point(b.get("geo", {}).get("value"))
+    rows.append({
+        "item": b["item"]["value"],
+        "itemLabel": b["itemLabel"]["value"],
+        "pleiadesID": b.get("pleiadesID", {}).get("value"),  # None if absent
+        "latitude": lat,
+        "longitude": lon,
+    })
+
+df = pd.DataFrame(rows)
+df = df.dropna(subset=["latitude", "longitude"])
+df["has_pleiades"] = df["pleiadesID"].notna()
+
+print(f"Loaded {len(df)} discovery sites — "
+      f"{df['has_pleiades'].sum()} with Pleiades link "
+      f"({100 * df['has_pleiades'].mean():.1f} %)")
+df.head()
+```
+
+## Step 3a — Pleiades coverage (sanity check)
+
+A two-bar summary before the map: how many discovery sites participate
+in the Pleiades cross-link ecosystem, and how many do not. The raw
+percentage is useful, but the absolute counts matter too — a high
+percentage on a small dataset is less reassuring than a middling
+percentage on a large one.
+
+```{pyodide}
+#| label: barchart-coverage
+#| autorun: false
+assert 'df' in dir() and not df.empty, "⚠ Run the data-loading cell first."
+
+import matplotlib.pyplot as plt
+
+counts = df["has_pleiades"].value_counts()
+labels = ["With Pleiades link" if k else "Without Pleiades link" for k in counts.index]
+colors = ["#2e7d32" if k else "#9e9e9e" for k in counts.index]
+
+fig, ax = plt.subplots(figsize=(7, 3.5))
+bars = ax.bar(labels, counts.values, color=colors)
+ax.set_ylabel("Number of discovery sites")
+ax.set_title(f"Pleiades coverage across {len(df)} Samian-ware discovery sites")
+for bar, v in zip(bars, counts.values):
+    ax.text(bar.get_x() + bar.get_width() / 2, v + 20,
+            f"{int(v)}\n({100 * v / len(df):.1f} %)",
+            ha="center", va="bottom")
+ax.set_ylim(0, counts.max() * 1.15)
+plt.tight_layout()
+plt.show()
+```
+
+## Step 3b — Map: sites with and without Pleiades link
+
+Two map layers, both toggleable via the layer control: sites with a
+Pleiades link in green, sites without in grey. Popups for Pleiades-
+linked sites include a direct link out to the Pleiades page, turning
+the map into a clickable gateway into the ancient-places LOD
+ecosystem.
+
+```{pyodide}
+#| label: map-sites
+#| autorun: false
+assert 'df' in dir() and not df.empty, "⚠ Run the data-loading cell first."
+
+import json, uuid
+
+markers_with = []
+markers_without = []
+for _, row in df.iterrows():
+    base = {
+        "lat": float(row["latitude"]),
+        "lon": float(row["longitude"]),
+        "name": row["itemLabel"],
+        "url": row["item"],
+    }
+    if row["has_pleiades"]:
+        base["pleiades"] = row["pleiadesID"]
+        markers_with.append(base)
+    else:
+        markers_without.append(base)
+
+payload = json.dumps({"withP": markers_with, "withoutP": markers_without})
+
+lat_c = float(df["latitude"].mean())
+lon_c = float(df["longitude"].mean())
+
+map_id = f"sites-map-{uuid.uuid4().hex[:8]}"
+data_var = f"__mapData_{map_id.replace('-', '_')}"
+
+COLOR_WITH = "#2e7d32"
+COLOR_WITHOUT = "#9e9e9e"
+
+html = f"""
+<div id="{map_id}" style="height:560px;width:100%;border:1px solid #ddd;border-radius:4px"></div>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.css" />
+<script>window["{data_var}"] = {payload};</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+    const mapId = "{map_id}";
+    const data = window["{data_var}"];
+    const centreLat = {lat_c};
+    const centreLon = {lon_c};
+    const colorWith = "{COLOR_WITH}";
+    const colorWithout = "{COLOR_WITHOUT}";
+
+    function loadFullscreen(cb) {{
+        if (typeof L !== 'undefined' && L.control && L.control.fullscreen) return cb();
+        if (typeof L === 'undefined') return setTimeout(() => loadFullscreen(cb), 50);
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.js';
+        s.onload = cb;
+        document.head.appendChild(s);
+    }}
+
+    let attempts = 0;
+    function init() {{
+        const el = document.getElementById(mapId);
+        if (!el || typeof L === 'undefined') return setTimeout(init, 50);
+        if (el._leaflet_id) return;
+        const hasFullscreen = !!(L.control && L.control.fullscreen);
+        if (!hasFullscreen && attempts < 40) {{ attempts++; return setTimeout(init, 50); }}
+
+        const osm = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }});
+        const osmHOT = L.tileLayer('https://{{s}}.tile.openstreetmap.fr/hot/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; OpenStreetMap contributors, Tiles style by Humanitarian OpenStreetMap Team'
+        }});
+        const esriImagery = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 18,
+            attribution: 'Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics'
+        }});
+        const esriTerrain = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 13,
+            attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA, DeLorme, and NPS'
+        }});
+
+        const layerWith = L.layerGroup();
+        const layerWithout = L.layerGroup();
+
+        for (const m of data.withP) {{
+            const popup = '<b>' + m.name + '</b><br>'
+                + '<a href="' + m.pleiades + '" target="_blank" rel="noopener">Pleiades ↗</a><br>'
+                + '<a href="' + m.url + '" target="_blank" rel="noopener">N4O KG</a>';
+            L.circleMarker([m.lat, m.lon], {{
+                radius: 4, color: colorWith, weight: 1,
+                fillColor: colorWith, fillOpacity: 0.7
+            }}).bindPopup(popup).addTo(layerWith);
+        }}
+        for (const m of data.withoutP) {{
+            const popup = '<b>' + m.name + '</b><br>'
+                + '<a href="' + m.url + '" target="_blank" rel="noopener">N4O KG</a>';
+            L.circleMarker([m.lat, m.lon], {{
+                radius: 4, color: colorWithout, weight: 1,
+                fillColor: colorWithout, fillOpacity: 0.55
+            }}).bindPopup(popup).addTo(layerWithout);
+        }}
+
+        const swatch = (c) => '<span style="display:inline-block;width:10px;height:10px;'
+            + 'background:' + c + ';border-radius:50%;margin-right:6px;vertical-align:middle"></span>';
+        const overlays = {{}};
+        overlays[swatch(colorWith) + 'With Pleiades link (' + data.withP.length + ')'] = layerWith;
+        overlays[swatch(colorWithout) + 'Without Pleiades link (' + data.withoutP.length + ')'] = layerWithout;
+
+        const mapOpts = {{
+            center: [centreLat, centreLon],
+            zoom: 4,
+            layers: [osm, layerWith, layerWithout]
+        }};
+        if (hasFullscreen) {{
+            mapOpts.fullscreenControl = true;
+            mapOpts.fullscreenControlOptions = {{ position: 'topleft' }};
+        }}
+        const map = L.map(mapId, mapOpts);
+
+        L.control.layers(
+            {{
+                "OpenStreetMap": osm,
+                "OpenStreetMap.HOT": osmHOT,
+                "Esri.WorldImagery": esriImagery,
+                "Esri.WorldTerrain": esriTerrain,
+            }},
+            overlays,
+            {{ collapsed: true }}
+        ).addTo(map);
+
+        setTimeout(() => map.invalidateSize(), 200);
+    }}
+
+    loadFullscreen(init);
+}})();
+</script>
+"""
+
+class _Html:
+    def __init__(self, s): self._s = s
+    def _repr_html_(self): return self._s
+_Html(html)
+```
+
+## Step 4 — Explore
+
+The `df` DataFrame stays in scope — modify the cell below to filter,
+aggregate, or sanity-check the Pleiades coverage in different ways.
+
+```{pyodide}
+#| label: explore
+#| autorun: false
+assert 'df' in dir(), "⚠ Run the data-loading cell first."
+
+# Hier anpassen: list unlinked sites in a lat band, inspect Pleiades IRIs, …
+df[df["has_pleiades"]].head(10)[["itemLabel", "pleiadesID"]]
+```
+
+---
+
+*Part of an Open Educational Resource series on knowledge graphs and
+linked open data, produced in the context of
+[NFDI4Objects](https://www.nfdi4objects.net/).*

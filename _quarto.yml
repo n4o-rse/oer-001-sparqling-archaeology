@@ -13,7 +13,7 @@ website:
     left:
       - text: "Skript"
         href: index.qmd
-      - text: "Jupyter Notebooks Linked Data"
+      - text: "Jupyter Notebooks: LOD"
         menu:
           - text: "Wikidata Ogham Site Diagrams"
             href: notebooks_lod/wikidata-ogham-sites-live.qmd
@@ -23,13 +23,19 @@ website:
             href: notebooks_lod/n4okg-ogham-sites-county-live.qmd
           - text: "NFDI4Objects KG Ogham Sites Leaflet Map"
             href: notebooks_lod/n4okg-ogham-sites-map-live.qmd
-      - text: "Jupyter Notebooks Academic Meta Tool"
+          - text: "NFDI4Objects KG Samian Production centres"
+            href: notebooks_lod/n4okg-samian-production-centres-live.qmd
+          - text: "NFDI4Objects KG Samian Discovery sites & Pleiades"
+            href: notebooks_lod/n4okg-samian-discovery-sites-live.qmd
+          - text: "NFDI4Objects KG Samian Potter activity"
+            href: notebooks_lod/n4okg-samian-potter-activity-live.qmd
+      - text: "Jupyter Notebooks: AMT"
         menu:
           - text: "AMT – Academic Meta Tool (interaktiv)"
             href: notebooks_amt/amt-live.qmd
-      - text: "SPARQLing Unicorn"
+      - text: "SPARQLing Unicorn QGIS Plugin"
         menu:
-          - text: "QGIS Plugin SPARQL query"
+          - text: "QGIS Plugin: SPARQL query"
             href: unicorn/sparql-queries.qmd
 
 execute:

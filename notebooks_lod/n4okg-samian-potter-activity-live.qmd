@@ -1,0 +1,503 @@
+---
+title: "Samian ware: potter activity at production centres"
+format: live-html
+engine: knitr
+pyodide:
+  packages:
+    - pandas
+    - matplotlib
+---
+
+{{< include ../_extensions/r-wasm/live/_knitr.qmd >}}
+
+This browser-executable notebook joins two SPARQL queries from the
+NFDI4Objects Knowledge Graph — one on **potter–centre assignments**
+with fuzzy confidence scores, the other on **production-centre
+geographies** — into a single proportional-symbol map that makes the
+productive mass of Samian-ware workshops visible at a glance.
+
+::: {.callout-note}
+On first load, your browser downloads the Python runtime (Pyodide, ~10 MB).
+Please allow a moment for it to initialise.
+:::
+
+::: {.callout-warning}
+The NFDI4Objects Knowledge Graph is a research prototype. If this
+notebook fails to load data with a *network error*, the endpoint may be
+temporarily unreachable or may not allow cross-origin browser requests
+from this page's domain. The local `.ipynb` companion is not affected
+by this and is always a reliable fallback.
+:::
+
+## About this notebook
+
+Samian-ware potters are known from stamps, decorative signatures, and
+stylistic attribution. Assigning a potter to a production centre is
+often a judgement call — a stamp may point to one workshop, stylistic
+analysis to another, and sometimes a potter is recorded as active at
+*several* sites. The NFDI4Objects Knowledge Graph captures this
+uncertainty explicitly through the **Academic Meta Tool (AMT)**
+vocabulary: every potter–centre assignment carries an `amt:weight`, a
+value in `[0, 1]` expressing confidence — `1.0` for secure
+attributions, fractional values (often `0.5`) for vague assignments
+derived from rules such as "worked at kilnsite A *or* kilnsite B".
+
+Summing those weights per centre yields a **productive-mass score**
+for each workshop: not a potter count, but a confidence-weighted
+estimate of how much potter activity was concentrated there. This
+notebook computes that score, joins it to the centre geographies, and
+plots the result. A companion local notebook,
+`n4okg-samian-potter-activity.ipynb`, runs the same pipeline against
+the full scientific Python stack.
+
+### Why this dataset?
+
+Fuzzy-score reasoning is a thread that runs through NFDI4Objects work
+on archaeological inference. The Samian-ware dataset is an unusually
+clean example: the same `amt:weight` mechanism feeds the AMT Python
+port's reasoning engine, and the scores here are the concrete output
+of that engine applied to real potter records. Visualising the weights
+spatially closes the loop between inference and interpretation.
+
+### What you'll learn
+
+- how to join two SPARQL result sets in pandas via a shared IRI column
+- how `SUM(xsd:decimal(?w))` in SPARQL gives a per-group confidence
+  aggregate
+- how to build a proportional-symbol map with range-labelled legend,
+  avoiding the common pitfall of scaling *radius* directly
+  (which exaggerates large values)
+
+### Data-context notes
+
+- query 1 (`ProductionCentre + KilnRegion + geometry`) has one row per
+  centre, around 100 in total
+- query 3 (`Potter × Centre, weighted`) has many thousand rows — one
+  per (potter, centre) pair, aggregated via `GROUP BY`
+- scores typically cluster around a few discrete values: `1.0` for
+  secure, `0.5` for two-way vague, `0.33…` for three-way, etc.
+- centres may carry more than one kiln-region label; we keep the first
+  encountered, matching query-1 behaviour
+- a centre with no potter records has score 0 and is not plotted
+  (inner-join semantics)
+
+### Tooling notes
+
+In the browser, both SPARQL calls go through `pyodide.http.pyfetch`;
+the join is pure pandas. Mapping uses a hand-rolled Leaflet block
+returned via `_repr_html_`. Radius is scaled as √score (area ∝ score)
+so that a centre with twice the score looks twice as busy, not four
+times as busy — the standard correction for proportional-symbol maps.
+
+## Step 1 — Define the SPARQL queries
+
+Two queries this time. The potter-activity query groups by centre and
+sums the confidence weights; the centre-geography query is the same
+one used in the production-centres notebook, reused here so the two
+notebooks can stand alone.
+
+```{pyodide}
+#| label: setup
+#| autorun: false
+from pyodide.http import pyfetch
+import urllib.parse
+import re
+import math
+import pandas as pd
+
+SPARQL_ENDPOINT = "https://graph.nfdi4objects.net/api/sparql"
+
+QUERY_ACTIVITY = """
+PREFIX rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX xsd:  <http://www.w3.org/2001/XMLSchema#>
+PREFIX lado: <http://archaeology.link/ontology#>
+PREFIX amt:  <http://academic-meta-tool.xyz/vocab#>
+SELECT ?item ?itemLabel ?actorEntity ?actorEntityLabel (SUM(xsd:decimal(?w)) AS ?score)
+WHERE {
+  GRAPH <https://graph.nfdi4objects.net/collection/8> {
+    ?actorEntity rdf:type lado:ActorEntity ;
+                 lado:hasAMT ?stmt .
+    ?stmt rdf:predicate lado:worksAtPlace ;
+          rdf:object ?item ;
+          amt:weight ?w .
+    ?item rdf:type lado:ProductionCentre .
+    OPTIONAL { ?item rdfs:label ?itemLabel . }
+    OPTIONAL { ?actorEntity rdfs:label ?actorEntityLabel . }
+  }
+}
+GROUP BY ?item ?itemLabel ?actorEntity ?actorEntityLabel
+ORDER BY ?itemLabel DESC(?score)
+"""
+
+QUERY_CENTRES = """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX lado: <http://archaeology.link/ontology#>
+SELECT ?item ?itemLabel ?geo ?kilnregion WHERE {
+  GRAPH <https://graph.nfdi4objects.net/collection/8> {
+    ?item <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://archaeology.link/ontology#ProductionCentre> .
+    ?item <http://www.opengis.net/ont/geosparql#hasGeometry> ?item_geom .
+    ?item_geom <http://www.opengis.net/ont/geosparql#asWKT> ?geo .
+    ?item rdfs:label ?itemLabel .
+    ?item lado:clusteredAs ?kr .
+    ?kr rdfs:label ?kilnregion .
+  }
+}
+"""
+
+async def fetch_sparql(endpoint, query):
+    # POST with form-encoded body is the SPARQL 1.1 standard transport for
+    # queries longer than typical URL limits, and more robust across
+    # endpoints than GET for queries that contain GRAPH clauses or long IRIs.
+    body = urllib.parse.urlencode({"query": query})
+    response = await pyfetch(
+        endpoint,
+        method="POST",
+        headers={
+            "Accept": "application/sparql-results+json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body=body,
+    )
+    data = await response.json()
+    return data["results"]["bindings"]
+
+print("✓ Helpers defined. Run the next cell to load the data.")
+```
+
+## Step 2 — Load the data
+
+Three dataframes are assembled here: `df_assignments` with one row per
+potter–centre pair, `df_centres` with one row per centre (geo +
+region), and `df_activity` — the per-centre aggregate computed from
+`df_assignments` and joined to `df_centres`. Keeping the intermediate
+dataframes around makes the Step-4 exploration cell more flexible.
+
+```{pyodide}
+#| label: load-data
+#| autorun: false
+_WKT_POINT_RE = re.compile(r"point\s*\(\s*([-+\d.eE]+)\s+([-+\d.eE]+)\s*\)",
+                           re.IGNORECASE)
+
+def parse_wkt_point(wkt):
+    if not wkt:
+        return (None, None)
+    m = _WKT_POINT_RE.search(wkt)
+    if not m:
+        return (None, None)
+    try:
+        lon, lat = float(m.group(1)), float(m.group(2))
+        return (lat, lon)
+    except ValueError:
+        return (None, None)
+
+# --- query 1: potter × centre with fuzzy score
+bindings_a = await fetch_sparql(SPARQL_ENDPOINT, QUERY_ACTIVITY)
+df_assignments = pd.DataFrame([
+    {
+        "item": b["item"]["value"],
+        "itemLabel": b.get("itemLabel", {}).get("value") or b["item"]["value"].rsplit("/", 1)[-1],
+        "actorEntity": b["actorEntity"]["value"],
+        "actorEntityLabel": b.get("actorEntityLabel", {}).get("value") or b["actorEntity"]["value"].rsplit("/", 1)[-1],
+        "score": float(b["score"]["value"]),
+    }
+    for b in bindings_a
+])
+
+# --- query 2: centre → geo + kiln region
+bindings_c = await fetch_sparql(SPARQL_ENDPOINT, QUERY_CENTRES)
+rows_c = []
+for b in bindings_c:
+    lat, lon = parse_wkt_point(b.get("geo", {}).get("value"))
+    rows_c.append({
+        "item": b["item"]["value"],
+        "itemLabel": b["itemLabel"]["value"],
+        "kilnregion": b["kilnregion"]["value"],
+        "latitude": lat,
+        "longitude": lon,
+    })
+df_centres = pd.DataFrame(rows_c)
+df_centres = df_centres.dropna(subset=["latitude", "longitude"])
+df_centres = df_centres.drop_duplicates(subset="item", keep="first").reset_index(drop=True)
+
+# --- aggregate potter activity per centre
+df_agg = df_assignments.groupby("item").agg(
+    total_score=("score", "sum"),
+    n_potters=("actorEntity", "nunique"),
+).reset_index()
+
+# --- join to geography
+df_activity = df_centres.merge(df_agg, on="item", how="inner")
+df_activity = df_activity.sort_values("total_score", ascending=False).reset_index(drop=True)
+
+print(f"Assignments : {len(df_assignments):>6} rows")
+print(f"Centres     : {len(df_centres):>6} rows")
+print(f"Active centres (with ≥1 potter) : {len(df_activity)}")
+df_activity.head()
+```
+
+## Step 3a — Top 15 centres by potter activity (sanity check)
+
+A horizontal bar chart of the 15 most productive centres orders the
+map's visual ranking numerically. Bars are coloured by kiln region to
+match the map palette below, so the two views can be read as one.
+
+```{pyodide}
+#| label: barchart-top
+#| autorun: false
+assert 'df_activity' in dir() and not df_activity.empty, "⚠ Run the data-loading cell first."
+
+import matplotlib.pyplot as plt
+
+PALETTE = [
+    "#e6194B", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
+    "#42d4f4", "#f032e6", "#469990", "#9A6324", "#800000",
+    "#808000", "#000075", "#e91e63", "#607d8b", "#795548",
+]
+regions = sorted(df_activity["kilnregion"].unique())
+region_colors = {r: PALETTE[i % len(PALETTE)] for i, r in enumerate(regions)}
+
+top15 = df_activity.head(15).iloc[::-1]  # reversed so biggest is on top in barh
+colors = [region_colors[r] for r in top15["kilnregion"]]
+
+fig, ax = plt.subplots(figsize=(9, 6))
+ax.barh(top15["itemLabel"], top15["total_score"], color=colors)
+ax.set_xlabel("Total potter activity (sum of AMT weights)")
+ax.set_title("Top 15 Samian-ware production centres by potter activity")
+for i, (v, n) in enumerate(zip(top15["total_score"], top15["n_potters"])):
+    ax.text(v + max(top15["total_score"]) * 0.01, i,
+            f"{v:.1f}  ({int(n)} potters)", va="center", fontsize=8)
+plt.tight_layout()
+plt.show()
+```
+
+## Step 3b — Proportional-symbol map
+
+Each active centre is drawn as a circle whose **area** (not radius)
+scales with the total potter-activity score. Colour encodes kiln
+region, so the map simultaneously answers *where is the activity
+concentrated?* and *which regional tradition is each centre part of?*.
+The legend reports three size ranges; the overlay control embeds
+colour swatches for each region.
+
+```{pyodide}
+#| label: map-activity
+#| autorun: false
+assert 'df_activity' in dir() and not df_activity.empty, "⚠ Run the data-loading cell first."
+
+import json, uuid, math
+
+# Size bucket ranges tuned to typical data shape — three buckets
+# covering the full dynamic range of total_score.
+score_max = float(df_activity["total_score"].max())
+BUCKETS = [
+    {"label": "1–10",   "min": 0,   "max": 10},
+    {"label": "11–50",  "min": 10,  "max": 50},
+    {"label": "51+",    "min": 50,  "max": score_max + 1},
+]
+
+def radius_for(score, s_max=score_max):
+    # Area ∝ score  →  radius ∝ √score. Min 5 px, max 30 px.
+    if s_max <= 0:
+        return 5
+    return 5 + 25 * math.sqrt(score / s_max)
+
+# Build per-centre top-10 potters for the popup
+top_potters_per_item = {}
+for item, grp in df_assignments.groupby("item"):
+    top = (grp.sort_values("score", ascending=False)
+               .head(10)[["actorEntityLabel", "score"]]
+               .to_dict("records"))
+    top_potters_per_item[item] = top
+
+markers = []
+for _, row in df_activity.iterrows():
+    markers.append({
+        "lat": float(row["latitude"]),
+        "lon": float(row["longitude"]),
+        "name": row["itemLabel"],
+        "region": row["kilnregion"],
+        "color": region_colors[row["kilnregion"]],
+        "radius": radius_for(float(row["total_score"])),
+        "score": float(row["total_score"]),
+        "n_potters": int(row["n_potters"]),
+        "url": row["item"],
+        "top": top_potters_per_item.get(row["item"], []),
+    })
+region_list = [{"region": r, "color": region_colors[r]} for r in regions]
+payload = json.dumps({"markers": markers, "regions": region_list, "buckets": BUCKETS})
+
+lat_c = float(df_activity["latitude"].mean())
+lon_c = float(df_activity["longitude"].mean())
+
+map_id = f"activity-map-{uuid.uuid4().hex[:8]}"
+data_var = f"__mapData_{map_id.replace('-', '_')}"
+
+html = f"""
+<div id="{map_id}" style="height:580px;width:100%;border:1px solid #ddd;border-radius:4px"></div>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.css" />
+<script>window["{data_var}"] = {payload};</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+    const mapId = "{map_id}";
+    const data = window["{data_var}"];
+    const centreLat = {lat_c};
+    const centreLon = {lon_c};
+
+    function loadFullscreen(cb) {{
+        if (typeof L !== 'undefined' && L.control && L.control.fullscreen) return cb();
+        if (typeof L === 'undefined') return setTimeout(() => loadFullscreen(cb), 50);
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.js';
+        s.onload = cb;
+        document.head.appendChild(s);
+    }}
+
+    let attempts = 0;
+    function init() {{
+        const el = document.getElementById(mapId);
+        if (!el || typeof L === 'undefined') return setTimeout(init, 50);
+        if (el._leaflet_id) return;
+        const hasFullscreen = !!(L.control && L.control.fullscreen);
+        if (!hasFullscreen && attempts < 40) {{ attempts++; return setTimeout(init, 50); }}
+
+        const osm = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }});
+        const osmHOT = L.tileLayer('https://{{s}}.tile.openstreetmap.fr/hot/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; OpenStreetMap contributors, Tiles style by Humanitarian OpenStreetMap Team'
+        }});
+        const esriImagery = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 18,
+            attribution: 'Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics'
+        }});
+        const esriTerrain = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 13,
+            attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA, DeLorme, and NPS'
+        }});
+
+        // One layer per kiln region (for the toggle + swatch-legend combo)
+        const regionLayers = {{}};
+        for (const r of data.regions) regionLayers[r.region] = L.layerGroup();
+
+        for (const m of data.markers) {{
+            let topList = '';
+            if (m.top && m.top.length) {{
+                topList = '<ol style="margin:4px 0 0 18px;padding:0;font-size:12px">';
+                for (const p of m.top) {{
+                    topList += '<li>' + p.actorEntityLabel
+                             + ' <span style="color:#666">('
+                             + Number(p.score).toFixed(2) + ')</span></li>';
+                }}
+                topList += '</ol>';
+            }}
+            const popup = '<b>' + m.name + '</b><br>'
+                + '<i>' + m.region + '</i><br>'
+                + 'Total score: <b>' + m.score.toFixed(2) + '</b><br>'
+                + 'Potters: <b>' + m.n_potters + '</b><br>'
+                + '<span style="font-size:12px">Top potters by score:</span>'
+                + topList
+                + '<a href="' + m.url + '" target="_blank" rel="noopener" '
+                + 'style="font-size:12px">View centre in N4O KG ↗</a>';
+            L.circleMarker([m.lat, m.lon], {{
+                radius: m.radius, color: m.color, weight: 1,
+                fillColor: m.color, fillOpacity: 0.7
+            }}).bindPopup(popup, {{ maxWidth: 320 }}).addTo(regionLayers[m.region]);
+        }}
+
+        const initialLayers = [osm];
+        const overlays = {{}};
+        for (const r of data.regions) {{
+            initialLayers.push(regionLayers[r.region]);
+            const sw = '<span style="display:inline-block;width:10px;height:10px;'
+                + 'background:' + r.color + ';border-radius:50%;'
+                + 'margin-right:6px;vertical-align:middle"></span>';
+            overlays[sw + r.region] = regionLayers[r.region];
+        }}
+
+        const mapOpts = {{ center: [centreLat, centreLon], zoom: 4, layers: initialLayers }};
+        if (hasFullscreen) {{
+            mapOpts.fullscreenControl = true;
+            mapOpts.fullscreenControlOptions = {{ position: 'topleft' }};
+        }}
+        const map = L.map(mapId, mapOpts);
+
+        L.control.layers(
+            {{
+                "OpenStreetMap": osm,
+                "OpenStreetMap.HOT": osmHOT,
+                "Esri.WorldImagery": esriImagery,
+                "Esri.WorldTerrain": esriTerrain,
+            }},
+            overlays,
+            {{ collapsed: true }}
+        ).addTo(map);
+
+        // Size legend (proportional-symbol ranges) in the bottom-left corner
+        const legend = L.control({{ position: 'bottomleft' }});
+        legend.onAdd = function() {{
+            const div = L.DomUtil.create('div');
+            div.style.cssText = 'background:white;padding:8px 10px;border:1px solid #bbb;'
+                + 'border-radius:4px;font-size:12px;line-height:1.6';
+            let html = '<b>Potter activity (score)</b><br>';
+            const sizes = [6, 12, 22];
+            for (let i = 0; i < data.buckets.length; i++) {{
+                const b = data.buckets[i];
+                const r = sizes[i];
+                html += '<div style="display:flex;align-items:center;gap:8px">'
+                     + '<span style="display:inline-block;width:' + (r*2) + 'px;'
+                     + 'height:' + (r*2) + 'px;border-radius:50%;'
+                     + 'background:#888;opacity:0.55;border:1px solid #555"></span>'
+                     + b.label + '</div>';
+            }}
+            div.innerHTML = html;
+            return div;
+        }};
+        legend.addTo(map);
+
+        setTimeout(() => map.invalidateSize(), 200);
+    }}
+
+    loadFullscreen(init);
+}})();
+</script>
+"""
+
+class _Html:
+    def __init__(self, s): self._s = s
+    def _repr_html_(self): return self._s
+_Html(html)
+```
+
+## Step 4 — Explore
+
+Three dataframes are in scope — `df_assignments` (raw potter × centre
+pairs), `df_centres` (centre geographies), and `df_activity` (the join
+used for the map). The example below lists the potters with the
+highest-score assignments to a single centre; change the filter to
+ask your own question.
+
+```{pyodide}
+#| label: explore
+#| autorun: false
+assert 'df_assignments' in dir(), "⚠ Run the data-loading cell first."
+
+# Hier anpassen: change the centre name, explore vague (score < 1) assignments…
+target = df_activity.iloc[0]["itemLabel"]
+print(f"Top potters at the most-active centre: {target}\n")
+(df_assignments[df_assignments["itemLabel"] == target]
+    .sort_values("score", ascending=False)
+    .head(10)[["actorEntityLabel", "score"]])
+```
+
+---
+
+*Part of an Open Educational Resource series on knowledge graphs and
+linked open data, produced in the context of
+[NFDI4Objects](https://www.nfdi4objects.net/).*

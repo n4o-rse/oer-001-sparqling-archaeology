@@ -1,0 +1,378 @@
+---
+title: "Samian ware: production centres and their kiln regions"
+format: live-html
+engine: knitr
+pyodide:
+  packages:
+    - pandas
+    - matplotlib
+---
+
+{{< include ../_extensions/r-wasm/live/_knitr.qmd >}}
+
+This browser-executable notebook queries the NFDI4Objects Knowledge Graph
+for Samian-ware **production centres**, retrieves their geographic
+coordinates and their assignment to higher-level **kiln regions**, and
+visualises the result on an interactive map.
+
+::: {.callout-note}
+On first load, your browser downloads the Python runtime (Pyodide, ~10 MB).
+Please allow a moment for it to initialise.
+:::
+
+::: {.callout-warning}
+The NFDI4Objects Knowledge Graph is a research prototype. If this
+notebook fails to load data with a *network error*, the endpoint may be
+temporarily unreachable or may not allow cross-origin browser requests
+from this page's domain. The local `.ipynb` companion is not affected
+by this and is always a reliable fallback.
+:::
+
+## About this notebook
+
+Samian ware (terra sigillata) was produced across the Roman Empire
+between the 1st century BCE and the 3rd century CE at a set of
+well-known workshop locations — La Graufesenque, Lezoux, Rheinzabern,
+and many others. The NFDI4Objects Knowledge Graph models each workshop
+as a `lado:ProductionCentre` and groups centres into higher-level
+`KilnRegion` clusters (e.g. *South Gaulish*, *Central Gaulish*).
+
+This notebook fetches that structure and plots it. A companion local
+notebook, `n4okg-samian-production-centres.ipynb`, runs the same
+pipeline against the full scientific Python stack (`SPARQLWrapper`,
+`folium`) for readers who prefer a Jupyter environment.
+
+### Why this dataset?
+
+Samian-ware production is a particularly good pedagogical dataset for
+geographic SPARQL visualisation: the number of centres is small enough
+(around 100) to plot as individual markers without clutter, the
+categorical grouping by kiln region gives a natural colour dimension,
+and the research tradition is mature enough that workshop locations
+and their clustering are well established.
+
+### What you'll learn
+
+- how to query a GeoSPARQL-typed `asWKT` literal from a Wikibase-style
+  knowledge graph
+- how to parse WKT point literals robustly across endpoints
+- how to build a categorical Leaflet marker map directly from a
+  pandas DataFrame
+
+### Data-context notes
+
+- `ProductionCentre` → `KilnRegion` is modelled via `lado:clusteredAs`
+- geometries use `geosparql:hasGeometry` / `geosparql:asWKT` — a
+  two-step indirection (the `asWKT` is attached to the geometry node,
+  not directly to the centre)
+- WKT literals on this endpoint use `POINT(lon lat)` (uppercase); the
+  parser below handles both casings defensively
+- one centre may in principle have more than one kiln-region label
+  attached; the code de-duplicates to one row per centre for the map
+
+### Tooling notes
+
+In the browser, SPARQL access goes through `pyodide.http.pyfetch` —
+`SPARQLWrapper` is not available in Pyodide (it depends on `requests`,
+which requires a system-level networking stack absent in WebAssembly).
+Mapping uses a hand-rolled Leaflet block returned via `_repr_html_`
+rather than `folium`, because `folium` writes its output to disk and
+relies on file-system paths that Pyodide cannot expose to the parent
+page.
+
+## Step 1 — Define the SPARQL query
+
+We retrieve every `ProductionCentre`, its label, its WKT geometry, and
+the label of its associated `KilnRegion`. The join across the
+geometry blank node (`?item_geom`) is a common pattern in GeoSPARQL
+data: the geometry literal is never attached directly to the feature,
+always via an intermediate node.
+
+```{pyodide}
+#| label: setup
+#| autorun: false
+from pyodide.http import pyfetch
+import urllib.parse
+import re
+import pandas as pd
+
+SPARQL_ENDPOINT = "https://graph.nfdi4objects.net/api/sparql"
+
+SPARQL_QUERY = """
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX lado: <http://archaeology.link/ontology#>
+SELECT ?item ?itemLabel ?geo ?kilnregion WHERE {
+  GRAPH <https://graph.nfdi4objects.net/collection/8> {
+    ?item <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://archaeology.link/ontology#ProductionCentre> .
+    ?item <http://www.opengis.net/ont/geosparql#hasGeometry> ?item_geom .
+    ?item_geom <http://www.opengis.net/ont/geosparql#asWKT> ?geo .
+    ?item rdfs:label ?itemLabel .
+    ?item lado:clusteredAs ?kr .
+    ?kr rdfs:label ?kilnregion .
+  }
+}
+"""
+
+async def fetch_sparql(endpoint, query):
+    # POST with form-encoded body is the SPARQL 1.1 standard transport for
+    # queries longer than typical URL limits, and more robust across
+    # endpoints than GET for queries that contain GRAPH clauses or long IRIs.
+    body = urllib.parse.urlencode({"query": query})
+    response = await pyfetch(
+        endpoint,
+        method="POST",
+        headers={
+            "Accept": "application/sparql-results+json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body=body,
+    )
+    data = await response.json()
+    return data["results"]["bindings"]
+
+print("✓ Helpers defined. Run the next cell to load the data.")
+```
+
+## Step 2 — Load the data
+
+The bindings from a SPARQL JSON result are flattened into a
+DataFrame. The WKT literal `POINT(lon lat)` is split into separate
+`latitude` and `longitude` columns using a case-insensitive regex
+parser — the same endpoint occasionally uses mixed casing across
+different collections, so we avoid brittle string slicing.
+
+```{pyodide}
+#| label: load-data
+#| autorun: false
+_WKT_POINT_RE = re.compile(r"point\s*\(\s*([-+\d.eE]+)\s+([-+\d.eE]+)\s*\)",
+                           re.IGNORECASE)
+
+def parse_wkt_point(wkt):
+    """Parse 'POINT(lon lat)' (any case) into (lat, lon) ready for Leaflet."""
+    if not wkt:
+        return (None, None)
+    m = _WKT_POINT_RE.search(wkt)
+    if not m:
+        return (None, None)
+    try:
+        lon, lat = float(m.group(1)), float(m.group(2))
+        return (lat, lon)
+    except ValueError:
+        return (None, None)
+
+bindings = await fetch_sparql(SPARQL_ENDPOINT, SPARQL_QUERY)
+
+rows = []
+for b in bindings:
+    lat, lon = parse_wkt_point(b.get("geo", {}).get("value"))
+    rows.append({
+        "item": b["item"]["value"],
+        "itemLabel": b["itemLabel"]["value"],
+        "kilnregion": b["kilnregion"]["value"],
+        "latitude": lat,
+        "longitude": lon,
+    })
+
+df = pd.DataFrame(rows)
+df = df.dropna(subset=["latitude", "longitude"])
+# One row per centre: if the same centre carries more than one kiln-region
+# label (rare but possible), keep the first and warn via the row count.
+df = df.drop_duplicates(subset="item", keep="first").reset_index(drop=True)
+
+print(f"Loaded {len(df)} production centres across "
+      f"{df['kilnregion'].nunique()} kiln regions")
+df.head()
+```
+
+## Step 3a — Centres per kiln region (sanity check)
+
+Before the map, a simple bar chart confirms the data shape and gives a
+numerical anchor for the spatial view that follows. Very uneven bars
+(one region with many centres, several with just one or two) are
+typical for Samian-ware production: research attention and survival
+bias favour the large South-Gaulish and Central-Gaulish clusters.
+
+```{pyodide}
+#| label: barchart-regions
+#| autorun: false
+assert 'df' in dir() and not df.empty, "⚠ Run the data-loading cell first."
+
+import matplotlib.pyplot as plt
+
+counts = df["kilnregion"].value_counts().sort_values(ascending=True)
+
+fig, ax = plt.subplots(figsize=(8, max(3, 0.35 * len(counts))))
+ax.barh(counts.index, counts.values, color="#4c72b0")
+ax.set_xlabel("Number of production centres")
+ax.set_title("Samian-ware production centres per kiln region")
+for i, v in enumerate(counts.values):
+    ax.text(v + 0.5, i, str(int(v)), va="center")
+plt.tight_layout()
+plt.show()
+```
+
+## Step 3b — Map of production centres
+
+Each centre becomes a `circleMarker` on a Leaflet map. Markers are
+coloured by kiln region, and the overlay control in the top-right
+corner doubles as a legend with coloured swatches: click a swatch to
+hide or show that group. Four basemaps are available via the same
+control.
+
+```{pyodide}
+#| label: map-centres
+#| autorun: false
+assert 'df' in dir() and not df.empty, "⚠ Run the data-loading cell first."
+
+import json, uuid
+
+PALETTE = [
+    "#e6194B", "#3cb44b", "#4363d8", "#f58231", "#911eb4",
+    "#42d4f4", "#f032e6", "#469990", "#9A6324", "#800000",
+    "#808000", "#000075", "#e91e63", "#607d8b", "#795548",
+]
+regions = sorted(df["kilnregion"].unique())
+region_colors = {r: PALETTE[i % len(PALETTE)] for i, r in enumerate(regions)}
+
+markers = [
+    {"lat": float(row["latitude"]), "lon": float(row["longitude"]),
+     "name": row["itemLabel"], "region": row["kilnregion"],
+     "color": region_colors[row["kilnregion"]], "url": row["item"]}
+    for _, row in df.iterrows()
+]
+region_list = [{"region": r, "color": region_colors[r]} for r in regions]
+payload = json.dumps({"markers": markers, "regions": region_list})
+
+# Sensible default view — roughly centred on the data
+lat_c = float(df["latitude"].mean())
+lon_c = float(df["longitude"].mean())
+
+map_id = f"centres-map-{uuid.uuid4().hex[:8]}"
+data_var = f"__mapData_{map_id.replace('-', '_')}"
+
+html = f"""
+<div id="{map_id}" style="height:560px;width:100%;border:1px solid #ddd;border-radius:4px"></div>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.css" />
+<script>window["{data_var}"] = {payload};</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+    const mapId = "{map_id}";
+    const data = window["{data_var}"];
+    const centreLat = {lat_c};
+    const centreLon = {lon_c};
+
+    function loadFullscreen(cb) {{
+        if (typeof L !== 'undefined' && L.control && L.control.fullscreen) return cb();
+        if (typeof L === 'undefined') return setTimeout(() => loadFullscreen(cb), 50);
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.js';
+        s.onload = cb;
+        document.head.appendChild(s);
+    }}
+
+    let attempts = 0;
+    function init() {{
+        const el = document.getElementById(mapId);
+        if (!el || typeof L === 'undefined') return setTimeout(init, 50);
+        if (el._leaflet_id) return;
+        const hasFullscreen = !!(L.control && L.control.fullscreen);
+        if (!hasFullscreen && attempts < 40) {{ attempts++; return setTimeout(init, 50); }}
+
+        const osm = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }});
+        const osmHOT = L.tileLayer('https://{{s}}.tile.openstreetmap.fr/hot/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; OpenStreetMap contributors, Tiles style by Humanitarian OpenStreetMap Team'
+        }});
+        const esriImagery = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 18,
+            attribution: 'Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics'
+        }});
+        const esriTerrain = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 13,
+            attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA, DeLorme, and NPS'
+        }});
+
+        // One layer group per kiln region
+        const regionLayers = {{}};
+        for (const r of data.regions) regionLayers[r.region] = L.layerGroup();
+
+        for (const m of data.markers) {{
+            const popup = '<b>' + m.name + '</b><br>'
+                + '<i>' + m.region + '</i><br>'
+                + '<a href="' + m.url + '" target="_blank" rel="noopener">View in N4O KG</a>';
+            L.circleMarker([m.lat, m.lon], {{
+                radius: 6, color: m.color, weight: 1,
+                fillColor: m.color, fillOpacity: 0.8
+            }}).bindPopup(popup).addTo(regionLayers[m.region]);
+        }}
+
+        const initialLayers = [osm];
+        const overlays = {{}};
+        for (const r of data.regions) {{
+            initialLayers.push(regionLayers[r.region]);
+            const sw = '<span style="display:inline-block;width:10px;height:10px;'
+                + 'background:' + r.color + ';border-radius:50%;'
+                + 'margin-right:6px;vertical-align:middle"></span>';
+            overlays[sw + r.region] = regionLayers[r.region];
+        }}
+
+        const mapOpts = {{ center: [centreLat, centreLon], zoom: 4, layers: initialLayers }};
+        if (hasFullscreen) {{
+            mapOpts.fullscreenControl = true;
+            mapOpts.fullscreenControlOptions = {{ position: 'topleft' }};
+        }}
+        const map = L.map(mapId, mapOpts);
+
+        L.control.layers(
+            {{
+                "OpenStreetMap": osm,
+                "OpenStreetMap.HOT": osmHOT,
+                "Esri.WorldImagery": esriImagery,
+                "Esri.WorldTerrain": esriTerrain,
+            }},
+            overlays,
+            {{ collapsed: true }}
+        ).addTo(map);
+
+        setTimeout(() => map.invalidateSize(), 200);
+    }}
+
+    loadFullscreen(init);
+}})();
+</script>
+"""
+
+class _Html:
+    def __init__(self, s): self._s = s
+    def _repr_html_(self): return self._s
+_Html(html)
+```
+
+## Step 4 — Explore
+
+The `df` DataFrame stays in scope — modify the cell below to filter,
+aggregate, or re-join however you like.
+
+```{pyodide}
+#| label: explore
+#| autorun: false
+assert 'df' in dir(), "⚠ Run the data-loading cell first."
+
+# Hier anpassen: filter by kiln region, list centres, sort by latitude…
+df[df["kilnregion"].str.contains("Gaul", case=False, na=False)] \
+    .sort_values("latitude", ascending=False) \
+    .head(10)
+```
+
+---
+
+*Part of an Open Educational Resource series on knowledge graphs and
+linked open data, produced in the context of
+[NFDI4Objects](https://www.nfdi4objects.net/).*
