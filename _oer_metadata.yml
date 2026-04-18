@@ -29,8 +29,8 @@ keywords:
   - Vagueness
 
 # Technische Metadaten
-site-url: &site https://nfdi4objects.github.io/oer-template-skript/
-repo-url: &repo https://github.com/nfdi4objects/oer-template-skript
+site-url: &site https://n4o-rse.github.io/oer-001-sparqling-archaeology/
+repo-url: &repo https://github.com/n4o-rse/oer-001-sparqling-archaeology
 doi: XXXXXXX.XXXXXXX
 
 # Vorgaben für den Appendix "Zitat"
@@ -39,21 +39,23 @@ csl: assets/csl/internet-archaeology.csl # Verweis auf CSL-Datei mit Zitierforma
 citation:
   type: document
   container-title: "Open Educational Resource"
-  publisher: Institution
+  publisher: Squirrel Papers, via Zenodo / Research Squirrel Engineers Network
   issued: 2026
   url: *site
   license: "https://creativecommons.org/licenses/by/4.0/"
 
 # Rechtliche Metadaten
 copyright: "Florian Thiery (2026)"
-license: CC BY # # Optionen für Lizensierungsangaben: https://quarto.org/docs/authoring/front-matter.html#license. Wird übernommen in automatisch erstellten Appendix "Lizenz".
+license:
+  type: open-access
+  text: CC BY-SA 4.0 and MIT # # Optionen für Lizensierungsangaben: https://quarto.org/docs/authoring/front-matter.html#license. Wird übernommen in automatisch erstellten Appendix "Lizenz".
 
 # Spezifische Metadaten für den Export in fachliche Metadatenschemata
 
 # OERSI (vgl. https://oersi.gitlab.io/metadata-form/metadata-generator.html)
-bildungsstufe: https://w3id.org/kim/educationalLevel/level_A
-materialart: https://w3id.org/kim/hcrt/script
-status: Draft # Draft, Incomplete, Published
+bildungsstufe: https://w3id.org/kim/educationalLevel/level_7
+materialart: https://w3id.org/kim/hcrt/drill_and_practice
+status: Published # Draft, Incomplete, Published
 
 # Schema für eigene Key-Value-Paare mit Bindestrich: custom-key: "custom-value"
 beispiel-key: beispiel-value
