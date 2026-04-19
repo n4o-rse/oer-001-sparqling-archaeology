@@ -71,7 +71,7 @@ The [FAIR-OER template documentation](https://nfdi4objects.github.io/n4o_oer-tem
  
 ## Licence
  
-This material is licensed under [Creative Commons Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/).
+This material is licensed under [Creative Commons Attribution–ShareAlike 4.0 International (CC BY-SA 4.0)](https://creativecommons.org/licenses/by-sa/4.0/).
  
 The templates in this repository are licensed under **[Creative Commons Attribution–ShareAlike 4.0 International (CC BY-SA 4.0)](https://creativecommons.org/licenses/by-sa/4.0/legalcode.en)**.
  
