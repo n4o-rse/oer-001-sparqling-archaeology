@@ -114,6 +114,8 @@ Available notebooks:
 - [NFDI4Objects KG Poseidon aDNA Sites Map](notebooks_lod/n4okg-poseidon-sites-map-live.qmd) ([Jupyter](https://github.com/n4o-rse/oer-001-sparqling-archaeology/raw/refs/heads/main/notebooks_lod/n4okg-poseidon-sites-map.ipynb)) — archaeogenetic samples from the [Poseidon Community Archive](https://www.poseidon-adna.org/) integrated via the [ArNO ontology](https://github.com/archaeonatural-cloud/archaeonatural-ontology); a multi-hop SPARQL query traverses `aDNASample → DiscoverySite → Site → Place → Country`, rendered as a country-coloured marker map and a log-scaled hex density map.
 - [NFDI4Objects KG Poseidon Country × Capture Type](notebooks_lod/n4okg-poseidon-country-capture-live.qmd) ([Jupyter](https://github.com/n4o-rse/oer-001-sparqling-archaeology/raw/refs/heads/main/notebooks_lod/n4okg-poseidon-country-capture.ipynb)) — the same dataset cross-tabulated by country and laboratory capture type (1240K, Shotgun, TwistArchaic, HumanOrigins), visualised as a stacked bar chart and a log-scaled heatmap; shows how a single tidy SPARQL result can drive complementary methodological views.
 - [Local TTL File: Campanian Ignimbrite Sites](notebooks_lod/local_ttl-campanian-ignimbrite-sites-live.qmd) ([Jupyter](https://github.com/n4o-rse/oer-001-sparqling-archaeology/raw/refs/heads/main/notebooks_lod/local_ttl-campanian-ignimbrite-sites.ipynb)) — loading a local Turtle file into the browser and querying it with `rdflib`.
+- [Local TTL File: SISAL Cave Sites](notebooks_lod/local_ttl-sisal-sites-live.qmd) ([Jupyter](https://github.com/n4o-rse/oer-001-sparqling-archaeology/raw/refs/heads/main/notebooks_lod/local_ttl-sisal-sites.ipynb)) — mapping 305 SISAL speleothem cave sites from a local Turtle file, with a marker map (archaeological status, UNESCO World Heritage, Wikidata links) and a country-level choropleth built via client-side point-in-polygon against Natural Earth boundaries. Data: [Kaushal et al. 2024, SISALv3](https://doi.org/10.5194/essd-16-1933-2024); RDF conversion from [Research-Squirrel-Engineers/GeoScience-FAIRification-LOD](https://github.com/Research-Squirrel-Engineers/GeoScience-FAIRification-LOD).
+- [Local TTL File: SISAL Corchia Isotopes](notebooks_lod/local_ttl-sisal-corchia-live.qmd) ([Jupyter](https://github.com/n4o-rse/oer-001-sparqling-archaeology/raw/refs/heads/main/notebooks_lod/local_ttl-sisal-corchia.ipynb)) — δ¹⁸O and δ¹³C speleothem records from *Antro del Corchia* (SISAL site 145, Apuan Alps), plotted against calendar age with Marine Isotope Stage bands. Demonstrates SPARQL-over-rdflib with pre-computed Savitzky–Golay smoothed values carried in the RDF graph.
 
 ### Jupyter Notebooks: AMT
 
@@ -131,11 +133,11 @@ The [SPARQLing Unicorn QGIS Plugin](https://github.com/sparqlunicorn/sparqlunico
 
 #### Install the SPARQLing Unicorn QGIS Plugin
 
-![](unicorn/unicorn_qgis_marketplace.png){width=480}
+![](unicorn/unicorn_qgis_marktplace.png){width=480}
 
-![](unicorn/unicorn_qgis_install_1.png){width=480}
+![](unicorn/unicorn_qgis_plugin_install_1.png){width=480}
 
-![](unicorn/unicorn_qgis_install_2.png){width=480}
+![](unicorn/unicorn_qgis_plugin_install_2.png){width=480}
 
 #### Query Triplestores
 

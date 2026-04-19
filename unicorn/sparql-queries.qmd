@@ -1,10 +1,10 @@
 # Install the SPARQLing Unicorn QGIS Plugin
 
-![](unicorn_qgis_marketplace.png)
+![](unicorn_qgis_marktplace.png)
 
-![](unicorn_qgis_install_1.png)
+![](unicorn_qgis_plugin_install_1.png)
 
-![](unicorn_qgis_install_2.png)
+![](unicorn_qgis_plugin_install_2.png)
 
 # Queries
 

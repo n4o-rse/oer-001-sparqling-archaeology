@@ -6,9 +6,9 @@ project:
     - notebooks_lod/campanian-ignimbrite_sites.ttl
     - notebooks_lod/sisal_sites.ttl
     - notebooks_lod/sisal_145_corchia_data.ttl
-    - unicorn/unicorn_qgis_marketplace.png
-    - unicorn/unicorn_qgis_install_1.png
-    - unicorn/unicorn_qgis_install_2.png
+    - unicorn/unicorn_qgis_marktplace.png
+    - unicorn/unicorn_qgis_plugin_install_1.png
+    - unicorn/unicorn_qgis_plugin_install_2.png
 
 website:
   title: "SPARQLing Archaeology"
