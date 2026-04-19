@@ -1,0 +1,630 @@
+---
+title: "Holy Wells in Ireland — a Wikidata exploration"
+format: live-html
+engine: knitr
+pyodide:
+  packages:
+    - pandas
+    - matplotlib
+---
+
+{{< include ../_extensions/r-wasm/live/_knitr.qmd >}}
+
+This notebook queries [Wikidata](https://www.wikidata.org/) for Irish
+holy wells and plots them on two maps: a marker map with images and
+cross-references, and a hex-binned density grid showing where wells
+cluster. The data model is a community effort of the
+[WikiProject HolyWells](https://www.wikidata.org/wiki/Wikidata:WikiProject_HolyWells),
+which links each well to its photograph on Wikimedia Commons and to
+its corresponding feature in OpenStreetMap.
+
+A local Jupyter companion (`holy-wells.ipynb`) runs the same pipeline
+with the full scientific Python stack.
+
+::: {.callout-note}
+On first load, your browser downloads the Python runtime (Pyodide,
+~10 MB). Please allow a moment for it to initialise.
+:::
+
+## About this notebook
+
+### Why this dataset?
+
+Irish holy wells are a near-ideal teaching dataset for linked open data:
+
+- **Well-curated and citizen-scientist-driven** — the WikiProject has
+  a consistent modelling schema (P31 = `holy well` + `holy well
+  semantic concept`), so a short query returns a clean, meaningful
+  slice of Wikidata.
+- **Cross-referenced across three open data hubs** — each well is
+  typically linked to Wikimedia Commons (image), OpenStreetMap (node
+  or way), and sometimes to the Irish Sites and Monuments Record.
+  This shows Linked Open Data doing its actual job: joining
+  independently maintained datasets through shared identifiers.
+- **Geographically clustered** — the Kilkenny concentration is a
+  real-world feature (local mapping effort, not a coverage bias in
+  the sense of a query artefact), which makes spatial aggregation
+  didactically meaningful.
+
+### Data-context notes
+
+A few specifics about this particular query result worth flagging:
+
+- The query returns **one row per image**, not one row per well. A
+  well with three photographs produces three rows — so the first
+  step after loading is to deduplicate on the Wikidata item URI.
+- All three enrichment properties (`P18` image, `P625` coordinates,
+  `P11693` OSM ID) are wrapped in `OPTIONAL`. Completeness varies:
+  almost every well has coordinates, many have an OSM link, a
+  substantial minority have a Commons image. The completeness
+  analysis in Step 4 is part of the point of this notebook.
+- Coordinates are returned as GeoSPARQL WKT literals in the form
+  `Point(lon lat)` — note the longitude-first order, which differs
+  from how mapping libraries expect inputs.
+
+### Tooling notes
+
+In the browser, HTTP libraries like `requests` and `SPARQLWrapper`
+aren't available because Pyodide runs under a Web Worker with no
+network stack of its own. We use `pyodide.http.pyfetch` — the
+browser's own `fetch` API exposed to Python. Mapping uses Leaflet
+directly via an HTML cell output, because `folium` writes files to
+disk and is awkward to embed inline. The local companion notebook
+uses `SPARQLWrapper` and `folium` and is otherwise identical in
+structure.
+
+## Step 1 — Define the SPARQL query
+
+The `P31` (*instance of*) filter uses two values joined by a comma,
+which is SPARQL shorthand for *both* — a well must be typed as the
+Wikidata class `Q1371047` (*holy well*) **and** the project's
+controlled concept `Q126443332` (*holy well semantic concept*). The
+two-class pattern is how the WikiProject distinguishes its curated
+items from uncurated ones elsewhere in Wikidata.
+
+```{pyodide}
+#| label: query
+#| autorun: false
+from pyodide.http import pyfetch
+import urllib.parse
+
+SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
+
+SPARQL_QUERY = """
+SELECT DISTINCT ?item ?itemLabel ?img ?geo ?osm WHERE {
+  ?item wdt:P31 wd:Q1371047, wd:Q126443332.
+  OPTIONAL { ?item wdt:P18 ?img. }
+  OPTIONAL { ?item wdt:P625 ?geo. }
+  OPTIONAL { ?item wdt:P11693 ?osm. }
+  SERVICE wikibase:label { bd:serviceParam wikibase:language "en". }
+}
+"""
+
+async def fetch_sparql(endpoint, query):
+    url = endpoint + "?" + urllib.parse.urlencode(
+        {"query": query, "format": "json"}
+    )
+    response = await pyfetch(url, headers={
+        "Accept": "application/sparql-results+json",
+        "User-Agent": "OER-HolyWells-Notebook/1.0"
+    })
+    data = await response.json()
+    return data["results"]["bindings"]
+
+bindings = await fetch_sparql(SPARQL_ENDPOINT, SPARQL_QUERY)
+print(f"✓ Retrieved {len(bindings)} rows from Wikidata")
+```
+
+## Step 2 — Load the data
+
+Two things happen here. First, we parse the WKT coordinate literal
+with a case-insensitive regex — Wikidata writes `Point(lon lat)`
+with a capital P, other endpoints use `POINT(...)`, and a defensive
+parser handles both without per-endpoint code. Second, we group by
+the Wikidata item URI so each well appears once, keeping the first
+image and OSM ID found and the count of images as metadata.
+
+```{pyodide}
+#| label: load
+#| autorun: false
+import re
+import pandas as pd
+
+assert bindings, "⚠ Please run the query cell first."
+
+_WKT_POINT_RE = re.compile(
+    r"point\s*\(\s*([-+\d.eE]+)\s+([-+\d.eE]+)\s*\)", re.IGNORECASE
+)
+
+def parse_wkt_point(wkt):
+    """Parse 'Point(lon lat)' (any case) into (lat, lon)."""
+    if not wkt:
+        return (None, None)
+    m = _WKT_POINT_RE.search(wkt)
+    if not m:
+        return (None, None)
+    try:
+        lon, lat = float(m.group(1)), float(m.group(2))
+        return (lat, lon)
+    except ValueError:
+        return (None, None)
+
+# Group rows by Wikidata item URI — a well with N images appears N times.
+records = {}
+for b in bindings:
+    uri = b["item"]["value"]
+    label = b.get("itemLabel", {}).get("value", "")
+    img = b.get("img", {}).get("value")
+    geo = b.get("geo", {}).get("value")
+    osm = b.get("osm", {}).get("value")
+    if uri not in records:
+        lat, lon = parse_wkt_point(geo)
+        records[uri] = {
+            "item": uri,
+            "qid": uri.rsplit("/", 1)[-1],
+            "itemLabel": label,
+            "latitude": lat,
+            "longitude": lon,
+            "osm": osm,
+            "img_first": img,
+            "img_count": 1 if img else 0,
+        }
+    else:
+        if img:
+            records[uri]["img_count"] += 1
+            if not records[uri]["img_first"]:
+                records[uri]["img_first"] = img
+
+df = pd.DataFrame(records.values())
+print(f"✓ {len(df)} unique wells ({len(bindings)} raw rows, "
+      f"{len(bindings) - len(df)} were duplicates from multiple images)")
+print(f"  with coordinates: {df['latitude'].notna().sum()}")
+print(f"  with image:       {(df['img_count'] > 0).sum()}")
+print(f"  with OSM ID:      {df['osm'].notna().sum()}")
+df.head()
+```
+
+## Step 3 — Visualise
+
+### Step 3a — Marker map with popups
+
+Each well becomes a clickable circle marker. The popup shows the
+well's name, a thumbnail of its Wikimedia Commons image (if one
+exists), and hyperlinks to the Wikidata item and the OpenStreetMap
+feature. This is the shape that Linked Open Data takes when it
+reaches the reader: a single data point with navigable attachments
+to multiple independently maintained open hubs.
+
+We build the map by emitting an HTML string and letting
+`quarto-live` insert it into the page. The Python side never
+touches the DOM — it can't, as Pyodide runs in a Web Worker.
+
+```{pyodide}
+#| label: map-markers
+#| autorun: false
+import json
+import uuid
+
+assert 'df' in dir() and not df.empty, "⚠ Please run the data-loading cell first."
+
+geo = df[df["latitude"].notna()].copy()
+
+def commons_thumb(img_url, width=200):
+    """Turn a direct Commons File URL into a thumbnail URL via Special:FilePath."""
+    if not img_url:
+        return None
+    filename = img_url.rsplit("/", 1)[-1]
+    return (f"https://commons.wikimedia.org/wiki/Special:FilePath/"
+            f"{filename}?width={width}")
+
+markers = []
+for _, row in geo.iterrows():
+    popup_parts = [f'<b>{row["itemLabel"]}</b>']
+    has_img = pd.notna(row["img_first"]) and bool(row["img_first"])
+    if has_img:
+        thumb = commons_thumb(row["img_first"], 220)
+        popup_parts.append(
+            f'<br><a href="{row["img_first"]}" target="_blank">'
+            f'<img src="{thumb}" style="max-width:220px;max-height:160px;'
+            f'margin-top:6px;border-radius:3px"></a>'
+        )
+        if row["img_count"] > 1:
+            popup_parts.append(
+                f'<br><small><i>{row["img_count"]} images on Commons</i></small>'
+            )
+    links = [f'<a href="{row["item"]}" target="_blank">Wikidata ({row["qid"]})</a>']
+    if pd.notna(row["osm"]) and row["osm"]:
+        osm_url = f'https://www.openstreetmap.org/?mlat={row["latitude"]}&mlon={row["longitude"]}#map=19/{row["latitude"]}/{row["longitude"]}'
+        links.append(f'<a href="{osm_url}" target="_blank">OSM ({row["osm"]})</a>')
+    popup_parts.append(
+        f'<br><small style="color:#555">{" · ".join(links)}</small>'
+    )
+    markers.append({
+        "lat": float(row["latitude"]),
+        "lon": float(row["longitude"]),
+        "popup": "".join(popup_parts),
+        "has_img": has_img,
+    })
+
+centre_lat = geo["latitude"].mean()
+centre_lon = geo["longitude"].mean()
+payload = json.dumps({"markers": markers,
+                      "centre": [float(centre_lat), float(centre_lon)]})
+
+map_id = f"wells-markers-{uuid.uuid4().hex[:8]}"
+data_var = f"__wellsMarkers_{map_id.replace('-', '_')}"
+
+html = f"""
+<div id="{map_id}" style="height:560px;width:100%;border:1px solid #ddd;
+     border-radius:4px"></div>
+<link rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet"
+      href="https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.css" />
+<script>window["{data_var}"] = {payload};</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+    const mapId  = "{map_id}";
+    const data   = window["{data_var}"];
+
+    function loadFullscreen(cb) {{
+        if (typeof L !== 'undefined' && L.control && L.control.fullscreen) return cb();
+        if (typeof L === 'undefined') return setTimeout(() => loadFullscreen(cb), 50);
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.js';
+        s.onload = cb;
+        s.onerror = cb;  // proceed without fullscreen if CDN blocked
+        document.head.appendChild(s);
+    }}
+
+    let attempts = 0;
+    function init() {{
+        const el = document.getElementById(mapId);
+        if (!el || typeof L === 'undefined') return setTimeout(init, 50);
+        if (el._leaflet_id) return;
+        const hasFullscreen = !!(L.control && L.control.fullscreen);
+        if (!hasFullscreen && attempts < 40) {{ attempts++; return setTimeout(init, 50); }}
+
+        const osm = L.tileLayer(
+            'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
+            {{ maxZoom: 19,
+               attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors' }}
+        );
+        const osmHOT = L.tileLayer(
+            'https://{{s}}.tile.openstreetmap.fr/hot/{{z}}/{{x}}/{{y}}.png',
+            {{ maxZoom: 19,
+               attribution: '&copy; OpenStreetMap contributors, Tiles style by <a href="https://www.hotosm.org/">HOT</a>' }}
+        );
+        const esriImg = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
+            {{ maxZoom: 18,
+               attribution: 'Tiles &copy; Esri &mdash; Sources: Esri, Maxar, Earthstar Geographics, and the GIS User Community' }}
+        );
+        const esriTer = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{{z}}/{{y}}/{{x}}',
+            {{ maxZoom: 13,
+               attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA, DeLorme, and NPS' }}
+        );
+
+        const withImg    = L.layerGroup();
+        const withoutImg = L.layerGroup();
+        for (const m of data.markers) {{
+            const colour = m.has_img ? '#1b7837' : '#8c8c8c';
+            const marker = L.circleMarker([m.lat, m.lon], {{
+                radius: 6, color: colour, weight: 1.2,
+                fillColor: colour, fillOpacity: 0.75
+            }}).bindPopup(m.popup, {{ maxWidth: 260 }});
+            marker.addTo(m.has_img ? withImg : withoutImg);
+        }}
+
+        const mapOpts = {{
+            center: data.centre, zoom: 8,
+            layers: [osm, withImg, withoutImg]
+        }};
+        if (hasFullscreen) {{
+            mapOpts.fullscreenControl = true;
+            mapOpts.fullscreenControlOptions = {{ position: 'topleft' }};
+        }}
+        const map = L.map(mapId, mapOpts);
+
+        const swatch = (c) => '<span style="display:inline-block;width:10px;height:10px;'
+            + 'background:' + c + ';border-radius:50%;margin-right:6px;'
+            + 'vertical-align:middle"></span>';
+        const overlays = {{}};
+        overlays[swatch('#1b7837') + 'with image'] = withImg;
+        overlays[swatch('#8c8c8c') + 'without image'] = withoutImg;
+
+        L.control.layers(
+            {{ 'OpenStreetMap': osm, 'OSM Humanitarian': osmHOT,
+               'Esri World Imagery': esriImg, 'Esri World Terrain': esriTer }},
+            overlays,
+            {{ collapsed: true }}
+        ).addTo(map);
+
+        setTimeout(() => map.invalidateSize(), 200);
+    }}
+    loadFullscreen(init);
+}})();
+</script>
+"""
+
+class _Html:
+    def __init__(self, s): self._s = s
+    def _repr_html_(self): return self._s
+_Html(html)
+```
+
+### Step 3b — Hex-binned density grid
+
+The marker map answers *where is each well*, but not *where do
+wells cluster*. For that, we bin the points into a hexagonal grid
+and colour each cell by count. Hex bins are built in pure Python —
+no Leaflet plugin needed, no canvas overlays to refresh on
+fullscreen. Each hex is a plain `L.polygon` object, which survives
+container resizing without any extra plumbing.
+
+The projection step (`y = lat / cos(φ₀)`) makes hexagons look
+regular at the data's reference latitude without requiring `pyproj`
+(unavailable in Pyodide's default package set).
+
+```{pyodide}
+#| label: map-hex
+#| autorun: false
+import math
+from collections import Counter
+import json, uuid
+
+assert 'df' in dir() and not df.empty, "⚠ Please run the data-loading cell first."
+
+geo = df[df["latitude"].notna()].copy()
+points = list(zip(geo["longitude"], geo["latitude"]))
+
+# Adjust HEX_SIZE_DEG to taste. Ireland sits around 53°N, so 0.12°
+# of longitude ≈ 8 km. Expect roughly 20–60 non-empty hexes for a
+# dataset this size — if you get too many singletons, increase;
+# if everything falls in a single cell, decrease.
+HEX_SIZE_DEG = 0.12
+phi0 = math.radians(geo["latitude"].mean())
+ky   = 1.0 / math.cos(phi0)
+
+def point_to_hex(lon, lat, size):
+    x, y = lon, lat * ky
+    q = (2/3) * x / size
+    r = (-1/3) * x / size + (math.sqrt(3)/3) * y / size
+    cx, cz = q, r; cy = -cx - cz
+    rx, ry, rz = round(cx), round(cy), round(cz)
+    dx, dy, dz = abs(rx - cx), abs(ry - cy), abs(rz - cz)
+    if dx > dy and dx > dz:   rx = -ry - rz
+    elif dy > dz:             ry = -rx - rz
+    else:                     rz = -rx - ry
+    return int(rx), int(rz)
+
+def hex_polygon(q, r, size):
+    cx = size * 1.5 * q
+    cy = size * math.sqrt(3) * (r + q/2)
+    return [((cy + size * math.sin(math.radians(60*i))) / ky,
+              cx + size * math.cos(math.radians(60*i))) for i in range(6)]
+
+counts = Counter(point_to_hex(lon, lat, HEX_SIZE_DEG) for lon, lat in points)
+max_n = max(counts.values()) if counts else 1
+ramp  = ["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"]
+
+def bucket_colour(n):
+    idx = min(len(ramp) - 1, int((n - 1) / max_n * len(ramp)))
+    return ramp[idx]
+
+# Build legend labels — integer count ranges per ramp step
+edges = [int(math.ceil((i + 1) / len(ramp) * max_n)) for i in range(len(ramp))]
+legend = []
+prev = 1
+for i, edge in enumerate(edges):
+    if edge < prev:
+        continue
+    legend.append({
+        "colour": ramp[i],
+        "label": f"{prev}" if edge == prev else f"{prev}–{edge}",
+    })
+    prev = edge + 1
+
+features = [{
+    "polygon": hex_polygon(q, r, HEX_SIZE_DEG),
+    "count":   n,
+    "color":   bucket_colour(n),
+} for (q, r), n in counts.items()]
+
+print(f"✓ {len(features)} non-empty hex cells "
+      f"(max count per cell: {max_n}, total wells binned: {len(points)})")
+
+centre_lat = geo["latitude"].mean()
+centre_lon = geo["longitude"].mean()
+payload = json.dumps({"features": features, "legend": legend,
+                      "centre": [float(centre_lat), float(centre_lon)]})
+
+map_id   = f"wells-hex-{uuid.uuid4().hex[:8]}"
+data_var = f"__wellsHex_{map_id.replace('-', '_')}"
+
+html = f"""
+<div id="{map_id}" style="height:560px;width:100%;border:1px solid #ddd;
+     border-radius:4px;position:relative"></div>
+<link rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet"
+      href="https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.css" />
+<script>window["{data_var}"] = {payload};</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+    const mapId  = "{map_id}";
+    const data   = window["{data_var}"];
+
+    function loadFullscreen(cb) {{
+        if (typeof L !== 'undefined' && L.control && L.control.fullscreen) return cb();
+        if (typeof L === 'undefined') return setTimeout(() => loadFullscreen(cb), 50);
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.js';
+        s.onload = cb;
+        s.onerror = cb;
+        document.head.appendChild(s);
+    }}
+
+    let attempts = 0;
+    function init() {{
+        const el = document.getElementById(mapId);
+        if (!el || typeof L === 'undefined') return setTimeout(init, 50);
+        if (el._leaflet_id) return;
+        const hasFullscreen = !!(L.control && L.control.fullscreen);
+        if (!hasFullscreen && attempts < 40) {{ attempts++; return setTimeout(init, 50); }}
+
+        const osm = L.tileLayer(
+            'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
+            {{ maxZoom: 19,
+               attribution: '&copy; OpenStreetMap contributors' }}
+        );
+        const esriTer = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{{z}}/{{y}}/{{x}}',
+            {{ maxZoom: 13,
+               attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA' }}
+        );
+
+        const hexLayer = L.layerGroup();
+        for (const f of data.features) {{
+            L.polygon(f.polygon, {{
+                color: '#555', weight: 0.7,
+                fillColor: f.color, fillOpacity: 0.72
+            }}).bindTooltip(
+                '<b>' + f.count + '</b> well' + (f.count !== 1 ? 's' : ''),
+                {{ sticky: true }}
+            ).addTo(hexLayer);
+        }}
+
+        const mapOpts = {{
+            center: data.centre, zoom: 8,
+            layers: [osm, hexLayer]
+        }};
+        if (hasFullscreen) {{
+            mapOpts.fullscreenControl = true;
+            mapOpts.fullscreenControlOptions = {{ position: 'topleft' }};
+        }}
+        const map = L.map(mapId, mapOpts);
+
+        L.control.layers(
+            {{ 'OpenStreetMap': osm, 'Esri World Terrain': esriTer }},
+            {{ 'Hex density': hexLayer }},
+            {{ collapsed: true }}
+        ).addTo(map);
+
+        // Inline legend in the bottom-right corner
+        const legend = L.control({{ position: 'bottomright' }});
+        legend.onAdd = function() {{
+            const div = L.DomUtil.create('div', 'hex-legend');
+            div.style.background = 'rgba(255,255,255,0.92)';
+            div.style.padding = '6px 10px';
+            div.style.borderRadius = '4px';
+            div.style.font = '12px/1.4 sans-serif';
+            div.style.boxShadow = '0 1px 3px rgba(0,0,0,0.15)';
+            let html = '<b>Wells per hex</b><br>';
+            for (const b of data.legend) {{
+                html += '<span style="display:inline-block;width:14px;height:14px;'
+                     + 'background:' + b.colour + ';border:1px solid #999;'
+                     + 'margin-right:6px;vertical-align:middle"></span>'
+                     + b.label + '<br>';
+            }}
+            div.innerHTML = html;
+            return div;
+        }};
+        legend.addTo(map);
+
+        setTimeout(() => map.invalidateSize(), 200);
+    }}
+    loadFullscreen(init);
+}})();
+</script>
+"""
+
+class _Html:
+    def __init__(self, s): self._s = s
+    def _repr_html_(self): return self._s
+_Html(html)
+```
+
+## Step 4 — Explore
+
+The DataFrame `df` stays in scope — feel free to modify the cells
+below, add new ones, or start queries of your own. Two starting
+points:
+
+### Completeness of cross-references
+
+How many wells are linked to each of the three open hubs? This is
+the kind of question a *data steward* would ask before writing a
+paper about the dataset: where are the gaps, what does "complete"
+mean here, and is the completeness evenly distributed?
+
+```{pyodide}
+#| label: explore-completeness
+#| autorun: false
+import matplotlib.pyplot as plt
+
+assert 'df' in dir() and not df.empty, "⚠ Please run the data-loading cell first."
+
+completeness = {
+    "has coordinates (P625)": df["latitude"].notna().sum(),
+    "has Commons image (P18)": (df["img_count"] > 0).sum(),
+    "has OSM ID (P11693)":     df["osm"].notna().sum(),
+    "has all three":           (
+        df["latitude"].notna() &
+        (df["img_count"] > 0) &
+        df["osm"].notna()
+    ).sum(),
+    "total wells":             len(df),
+}
+
+for k, v in completeness.items():
+    pct = 100 * v / len(df)
+    print(f"  {k:28s} {v:4d}   ({pct:5.1f}%)")
+
+fig, ax = plt.subplots(figsize=(7, 3.2))
+keys = list(completeness.keys())
+vals = [completeness[k] for k in keys]
+ax.barh(keys, vals, color=["#4C72B0","#55A868","#C44E52","#8172B2","#CCB974"])
+ax.set_xlabel("number of wells")
+ax.set_title("Completeness of Wikidata cross-references")
+ax.invert_yaxis()
+for i, v in enumerate(vals):
+    ax.text(v + 2, i, str(v), va="center", fontsize=9)
+plt.tight_layout()
+plt.show()
+```
+
+### Top image contributors
+
+Which wells are the most thoroughly photographed? Multiple photos
+on Commons usually mean the well is locally significant, easily
+accessible, or has been the target of a focused documentation
+effort. Counting images per well is a cheap proxy for *how much
+attention a citizen-science community has paid to this object*.
+
+```{pyodide}
+#| label: explore-topimg
+#| autorun: false
+assert 'df' in dir() and not df.empty, "⚠ Please run the data-loading cell first."
+
+top = (df[df["img_count"] > 0]
+       .sort_values("img_count", ascending=False)
+       .head(12)
+       [["itemLabel", "img_count", "qid"]])
+
+print(f"Top {len(top)} wells by number of images on Commons:\n")
+for _, row in top.iterrows():
+    print(f"  {row['img_count']:2d}  {row['itemLabel']:40s}  ({row['qid']})")
+```
+
+---
+
+*Part of an Open Educational Resource series on knowledge graphs
+and linked open data, produced in the context of
+[NFDI4Objects](https://www.nfdi4objects.net/). Data: Wikidata
+[WikiProject HolyWells](https://www.wikidata.org/wiki/Wikidata:WikiProject_HolyWells),
+CC0. Tiles: OpenStreetMap contributors, Esri. Images: Wikimedia
+Commons contributors.*
