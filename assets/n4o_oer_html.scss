@@ -227,9 +227,9 @@ figure figcaption,
 .callout.callout-warning > .callout-header,
 .callout.callout-warning.callout-style-default > .callout-header,
 .callout.callout-warning.callout-style-simple  > .callout-header {
-  background-color: rgba($brand-akzent, 0.60) !important;
-  background-color: color-mix(in srgb, $brand-akzent 85%, $brand-hintergrund) !important;
-  color: $brand-hintergrund !important;
+  background-color: rgba($brand-warnung, 0.60) !important;
+  background-color: color-mix(in srgb, $brand-warnung 85%, $brand-hintergrund) !important;
+  color: $brand-text !important;
 }
 
 // Linker Rand der Callouts einheitlich

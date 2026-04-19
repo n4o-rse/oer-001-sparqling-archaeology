@@ -22,13 +22,14 @@ logo:
 color:
   palette:
     hintergrund: "#FFFFFF"         # Seitenhintergrund
-    text: "#13294B"                # Standard-Textfarbe
-    akzent: "#0084FF"              # Hauptakzent (Links, Fokus, Buttons)
-    cd-farbe: "#E7C6AC"            # Hauptfarbe des CD
-    cd-farbe-abstufung1: "#CD8255" # Weitere CD-Farbabstufung
+    text: "#08324f"                # Standard-Textfarbe (Dunkelblau aus OER-Logo)
+    akzent: "#144e62"              # Hauptakzent (Links, Fokus, Buttons) — aus OER-Logo
+    cd-farbe: "#195f6f"            # Hauptfarbe des CD (Navbar-Hintergrund) — aus OER-Logo
+    cd-farbe-abstufung1: "#CD8255" # Weitere CD-Farbabstufung (Secondary, Terrakotta)
     cd-farbe-abstufung2: "#BCA089" # Weitere CD-Farbabstufung
     cd-farbe-abstufung3: "#CFC5BA" # Weitere CD-Farbabstufung
     flaeche: "#F2F2F2"             # Karten, Boxen, Gruppierungen
+    navbar-text: "#FFFFFF"         # Text in der Navbar (weiß, Kontrast zu cd-farbe ~ 7.2:1 AAA)
     erfolg: "#2E7D32"              # Positive Hinweise
     hinweis: "#0288D1"             # Sachliche Informationen
     warnung: "#ED6C02"             # Warnungen
@@ -83,7 +84,7 @@ defaults:
   # Vorder- und Hintergrund
       body-bg: $brand-hintergrund
       navbar-bg: $brand-cd-farbe
-      navbar-fg: $brand-text
+      navbar-fg: $brand-navbar-text
   # Abstände
       spacer: 1rem
   # Überschriften
@@ -119,7 +120,7 @@ defaults:
       callout-icon-scale: 100%
       callout-margin-top: 1.25rem
       callout-margin-bottom: 1.25rem
-      callout-color-note: $brand-cd-farbe
+      callout-color-note: $brand-cd-farbe-abstufung3
       callout-color-tip: $brand-hinweis
       callout-color-caution: $brand-warnung
       callout-color-warning: $brand-warnung
