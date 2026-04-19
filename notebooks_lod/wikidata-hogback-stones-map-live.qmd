@@ -1,0 +1,678 @@
+---
+title: "Hogback Stones in northern Britain — a Wikidata exploration"
+format: live-html
+engine: knitr
+pyodide:
+  packages:
+    - pandas
+    - matplotlib
+---
+
+{{< include ../_extensions/r-wasm/live/_knitr.qmd >}}
+
+This notebook queries [Wikidata](https://www.wikidata.org/) for
+hogback stones — a distinctive group of tenth- and early-eleventh-century
+carved stone grave-covers from northern England and southern
+Scotland. Four views build on each other: a marker map, a hex-binned
+density grid revealing the core areas, a site-level bar chart that
+reconstructs Williams' (2015) observation that a handful of sites
+produce the bulk of the corpus, and a completeness chart comparing
+how much of Wikidata's modelling machinery is actually populated
+for this small dataset.
+
+The data is curated by the Wikidata
+[WikiProject Hogback](https://www.wikidata.org/wiki/Wikidata:WikiProject_Hogback);
+see [Wikipedia on Hogback (sculpture)](https://en.wikipedia.org/wiki/Hogback_(sculpture))
+for the wider archaeological background.
+
+::: {.callout-note}
+On first load, your browser downloads the Python runtime (Pyodide,
+~10 MB). Please allow a moment for it to initialise.
+:::
+
+## About this notebook
+
+### Why this dataset?
+
+Hogback stones are a small, well-bounded corpus — around four
+dozen modelled items in Wikidata at time of writing — which makes
+them ideal for teaching analytical techniques that need less
+heavyweight presentation than a large dataset:
+
+- **Small-n archaeology as a teaching case** — Williams (2015)
+  stresses that hogbacks crop up in "discrete clusters" along
+  maritime networks, with three or four sites dominating the
+  surviving corpus. A forty-item dataset makes that clustering
+  visually immediate; the same pattern in a dataset of four
+  thousand points would wash out in a density heatmap.
+- **Label-driven site extraction** — item labels follow
+  semi-regular patterns ("Hogback von Lythe", "Gosforth Hogback 1",
+  "Govan Stone 02 (Hogback)"), which lets us reconstruct site-level
+  groupings from strings. This is *not* how you would do it in
+  production (a proper `P276` *location* join would be cleaner),
+  but it shows honestly what happens when an ontology is under-used
+  and you have to recover structure from labels.
+- **Cross-referenced to Commons and OSM** — like the holy wells,
+  most hogbacks link to a Wikimedia Commons image and an OSM node,
+  so the citizen-science completeness question is as pertinent
+  here as there.
+
+### Data-context notes
+
+A few features of the result worth flagging before we load it:
+
+- There are more **items** than photographed **monuments**: some
+  items represent a group (e.g. `St Helen's Church, church &
+  hog-backed monuments` is a single Wikidata item for a
+  multi-monument site).
+- The 43 items are not evenly distributed — core sites (Brompton,
+  Lythe, Sockburn-on-Tees, Govan) dominate, matching Williams' core-area
+  observation. This will be visible on both the hex grid and the
+  site-level bar chart.
+- Coordinates are returned as `Point(lon lat)` — WKT with
+  longitude first. A defensive regex parser is used, same as in
+  the holy-wells notebooks.
+
+### Tooling notes
+
+Same browser stack as the holy-wells notebooks: `pyodide.http.pyfetch`
+for SPARQL (Pyodide cannot use `requests` or `SPARQLWrapper`), Leaflet
+via inline HTML for the two maps, `matplotlib` for the bar charts.
+
+## Step 1 — Define the SPARQL query
+
+The query is short because the modelling of hogbacks in Wikidata is
+straightforward: anything that is `wdt:P31 wd:Q1570646` (*instance of*
+*hogback*) counts, and we pull three optional enrichment properties
+alongside the label.
+
+```{pyodide}
+#| label: query
+#| autorun: false
+from pyodide.http import pyfetch
+import urllib.parse
+
+SPARQL_ENDPOINT = "https://query.wikidata.org/sparql"
+
+SPARQL_QUERY = """
+SELECT ?item ?itemLabel ?osmnode ?img ?geo WHERE {
+  ?item wdt:P31 wd:Q1570646.
+  OPTIONAL { ?item wdt:P11693 ?osmnode. }
+  OPTIONAL { ?item wdt:P18 ?img. }
+  OPTIONAL { ?item wdt:P625 ?geo. }
+  SERVICE wikibase:label {
+    bd:serviceParam wikibase:language "[AUTO_LANGUAGE],mul,en".
+  }
+}
+"""
+
+async def fetch_sparql(endpoint, query):
+    url = endpoint + "?" + urllib.parse.urlencode(
+        {"query": query, "format": "json"}
+    )
+    response = await pyfetch(url, headers={
+        "Accept": "application/sparql-results+json",
+        "User-Agent": "OER-Hogbacks-Notebook/1.0"
+    })
+    data = await response.json()
+    return data["results"]["bindings"]
+
+bindings = await fetch_sparql(SPARQL_ENDPOINT, SPARQL_QUERY)
+print(f"✓ Retrieved {len(bindings)} rows from Wikidata")
+```
+
+## Step 2 — Load the data
+
+Because of the `[AUTO_LANGUAGE],mul,en` label fallback, labels come
+back in whatever language the browser prefers, with `mul` and `en` as
+backup. The site-extraction step below handles both the German
+"Hogback von X" and the English "X Hogback" / "X hogback NN"
+patterns with a small regex cascade.
+
+```{pyodide}
+#| label: load
+#| autorun: false
+import re
+import pandas as pd
+
+assert bindings, "⚠ Please run the query cell first."
+
+_WKT_POINT_RE = re.compile(
+    r"point\s*\(\s*([-+\d.eE]+)\s+([-+\d.eE]+)\s*\)", re.IGNORECASE
+)
+
+def parse_wkt_point(wkt):
+    if not wkt:
+        return (None, None)
+    m = _WKT_POINT_RE.search(wkt)
+    if not m:
+        return (None, None)
+    try:
+        lon, lat = float(m.group(1)), float(m.group(2))
+        return (lat, lon)
+    except ValueError:
+        return (None, None)
+
+def extract_site(label):
+    """Recover a site name from a hogback item label.
+
+    Handles the common label patterns:
+      'Hogback von Lythe'             -> 'Lythe'
+      'Lythe Hogback'                 -> 'Lythe'
+      'Gosforth Hogback 1'            -> 'Gosforth'
+      'Ancrum hogback'                -> 'Ancrum'
+      'Govan Stone 02 (Hogback)'      -> 'Govan'
+      "St Helen's Church, church ..." -> "St Helen's Church"
+      'The Giant's Grave'             -> keep as-is (unique named site)
+    """
+    label = (label or "").strip()
+    if not label:
+        return "(unlabelled)"
+    m = re.match(r"^Hogback von (.+)$", label)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r"^(.+?)\s+Stone\s+\d+.*$", label)
+    if m:
+        return m.group(1).strip()
+    m = re.match(r"^(.+?)\s+[Hh]ogback(?:\s+\d+)?$", label)
+    if m:
+        return m.group(1).strip()
+    if "," in label:
+        return label.split(",", 1)[0].strip()
+    return label
+
+# Build one record per item
+records = []
+for b in bindings:
+    uri = b["item"]["value"]
+    label = b.get("itemLabel", {}).get("value", "")
+    geo = b.get("geo", {}).get("value")
+    lat, lon = parse_wkt_point(geo)
+    records.append({
+        "item": uri,
+        "qid": uri.rsplit("/", 1)[-1],
+        "itemLabel": label,
+        "site": extract_site(label),
+        "latitude": lat,
+        "longitude": lon,
+        "img": b.get("img", {}).get("value"),
+        "osmnode": b.get("osmnode", {}).get("value"),
+    })
+df = pd.DataFrame(records)
+
+print(f"✓ {len(df)} hogback items")
+print(f"  with coordinates: {df['latitude'].notna().sum()}")
+print(f"  with image:       {df['img'].notna().sum()}")
+print(f"  with OSM node:    {df['osmnode'].notna().sum()}")
+print(f"  distinct sites:   {df['site'].nunique()}")
+
+df[["qid", "itemLabel", "site", "latitude", "longitude"]].head(10)
+```
+
+## Step 3 — Visualise
+
+### Step 3a — Marker map with popups
+
+Each hogback is a clickable circle marker. The popup shows the
+item's label, a thumbnail of its Wikimedia Commons image (if one
+exists), and hyperlinks to Wikidata and OpenStreetMap.
+
+```{pyodide}
+#| label: map-markers
+#| autorun: false
+import json, uuid
+
+assert 'df' in dir() and not df.empty, "⚠ Please run the data-loading cell first."
+
+geo = df[df["latitude"].notna()].copy()
+
+def commons_thumb(img_url, width=220):
+    if not img_url:
+        return None
+    filename = img_url.rsplit("/", 1)[-1]
+    return (f"https://commons.wikimedia.org/wiki/Special:FilePath/"
+            f"{filename}?width={width}")
+
+markers = []
+for _, row in geo.iterrows():
+    popup_parts = [f'<b>{row["itemLabel"]}</b>']
+    popup_parts.append(f'<br><small>site: {row["site"]}</small>')
+    has_img = pd.notna(row["img"]) and bool(row["img"])
+    if has_img:
+        thumb = commons_thumb(row["img"], 220)
+        popup_parts.append(
+            f'<br><a href="{row["img"]}" target="_blank">'
+            f'<img src="{thumb}" style="max-width:220px;max-height:160px;'
+            f'margin-top:6px;border-radius:3px"></a>'
+        )
+    links = [f'<a href="{row["item"]}" target="_blank">Wikidata ({row["qid"]})</a>']
+    if pd.notna(row["osmnode"]) and row["osmnode"]:
+        osm_url = (f'https://www.openstreetmap.org/?mlat={row["latitude"]}'
+                   f'&mlon={row["longitude"]}#map=19/{row["latitude"]}/{row["longitude"]}')
+        links.append(f'<a href="{osm_url}" target="_blank">OSM ({row["osmnode"]})</a>')
+    popup_parts.append(
+        f'<br><small style="color:#555">{" · ".join(links)}</small>'
+    )
+    markers.append({
+        "lat": float(row["latitude"]),
+        "lon": float(row["longitude"]),
+        "popup": "".join(popup_parts),
+        "has_img": has_img,
+    })
+
+centre_lat = geo["latitude"].mean()
+centre_lon = geo["longitude"].mean()
+payload = json.dumps({"markers": markers,
+                      "centre": [float(centre_lat), float(centre_lon)]})
+
+map_id   = f"hogbacks-markers-{uuid.uuid4().hex[:8]}"
+data_var = f"__hogbackMarkers_{map_id.replace('-', '_')}"
+
+html = f"""
+<div id="{map_id}" style="height:560px;width:100%;border:1px solid #ddd;
+     border-radius:4px"></div>
+<link rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet"
+      href="https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.css" />
+<script>window["{data_var}"] = {payload};</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+    const mapId  = "{map_id}";
+    const data   = window["{data_var}"];
+
+    function loadFullscreen(cb) {{
+        if (typeof L !== 'undefined' && L.control && L.control.fullscreen) return cb();
+        if (typeof L === 'undefined') return setTimeout(() => loadFullscreen(cb), 50);
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.js';
+        s.onload = cb;
+        s.onerror = cb;
+        document.head.appendChild(s);
+    }}
+
+    let attempts = 0;
+    function init() {{
+        const el = document.getElementById(mapId);
+        if (!el || typeof L === 'undefined') return setTimeout(init, 50);
+        if (el._leaflet_id) return;
+        const hasFullscreen = !!(L.control && L.control.fullscreen);
+        if (!hasFullscreen && attempts < 40) {{ attempts++; return setTimeout(init, 50); }}
+
+        const osm = L.tileLayer(
+            'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
+            {{ maxZoom: 19,
+               attribution: '&copy; OpenStreetMap contributors' }}
+        );
+        const osmHOT = L.tileLayer(
+            'https://{{s}}.tile.openstreetmap.fr/hot/{{z}}/{{x}}/{{y}}.png',
+            {{ maxZoom: 19,
+               attribution: '&copy; OpenStreetMap contributors, Tiles style by HOT' }}
+        );
+        const esriImg = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
+            {{ maxZoom: 18,
+               attribution: 'Tiles &copy; Esri' }}
+        );
+        const esriTer = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{{z}}/{{y}}/{{x}}',
+            {{ maxZoom: 13,
+               attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA' }}
+        );
+
+        const withImg    = L.layerGroup();
+        const withoutImg = L.layerGroup();
+        for (const m of data.markers) {{
+            const colour = m.has_img ? '#1b7837' : '#8c8c8c';
+            L.circleMarker([m.lat, m.lon], {{
+                radius: 6, color: colour, weight: 1.2,
+                fillColor: colour, fillOpacity: 0.8
+            }}).bindPopup(m.popup, {{ maxWidth: 260 }})
+              .addTo(m.has_img ? withImg : withoutImg);
+        }}
+
+        const mapOpts = {{
+            center: data.centre, zoom: 6,
+            layers: [osm, withImg, withoutImg]
+        }};
+        if (hasFullscreen) {{
+            mapOpts.fullscreenControl = true;
+            mapOpts.fullscreenControlOptions = {{ position: 'topleft' }};
+        }}
+        const map = L.map(mapId, mapOpts);
+
+        const swatch = c => '<span style="display:inline-block;width:10px;height:10px;'
+            + 'background:' + c + ';border-radius:50%;margin-right:6px;'
+            + 'vertical-align:middle"></span>';
+        const overlays = {{}};
+        overlays[swatch('#1b7837') + 'with image'] = withImg;
+        overlays[swatch('#8c8c8c') + 'without image'] = withoutImg;
+
+        L.control.layers(
+            {{ 'OpenStreetMap': osm, 'OSM Humanitarian': osmHOT,
+               'Esri World Imagery': esriImg, 'Esri World Terrain': esriTer }},
+            overlays, {{ collapsed: true }}
+        ).addTo(map);
+
+        setTimeout(() => map.invalidateSize(), 200);
+    }}
+    loadFullscreen(init);
+}})();
+</script>
+"""
+
+class _Html:
+    def __init__(self, s): self._s = s
+    def _repr_html_(self): return self._s
+_Html(html)
+```
+
+### Step 3b — Hex-binned density grid
+
+Hogback sites cluster sharply — a handful of core locations
+(Brompton, Lythe, Sockburn-on-Tees, Govan, Gosforth) account for
+most of the surviving corpus. With only ~40 points spread across
+northern Britain, a smaller hex size would produce mostly
+singletons; we use a larger cell (~0.4° ≈ 30 km at 54°N) so that
+multiple items at one site fall into the same hex and the
+clustering message comes through.
+
+```{pyodide}
+#| label: map-hex
+#| autorun: false
+import math, json, uuid
+from collections import Counter
+
+assert 'df' in dir() and not df.empty, "⚠ Please run the data-loading cell first."
+
+geo = df[df["latitude"].notna()].copy()
+points = list(zip(geo["longitude"], geo["latitude"]))
+
+# Larger hex size than the holy-wells notebook — fewer points, wider
+# spread, so we want each core site to pull into a single cell.
+HEX_SIZE_DEG = 0.40
+phi0 = math.radians(geo["latitude"].mean())
+ky   = 1.0 / math.cos(phi0)
+
+def point_to_hex(lon, lat, size):
+    x, y = lon, lat * ky
+    q = (2/3) * x / size
+    r = (-1/3) * x / size + (math.sqrt(3)/3) * y / size
+    cx, cz = q, r; cy = -cx - cz
+    rx, ry, rz = round(cx), round(cy), round(cz)
+    dx, dy, dz = abs(rx - cx), abs(ry - cy), abs(rz - cz)
+    if dx > dy and dx > dz:   rx = -ry - rz
+    elif dy > dz:             ry = -rx - rz
+    else:                     rz = -rx - ry
+    return int(rx), int(rz)
+
+def hex_polygon(q, r, size):
+    cx = size * 1.5 * q
+    cy = size * math.sqrt(3) * (r + q/2)
+    return [((cy + size * math.sin(math.radians(60*i))) / ky,
+              cx + size * math.cos(math.radians(60*i))) for i in range(6)]
+
+counts = Counter(point_to_hex(lon, lat, HEX_SIZE_DEG) for lon, lat in points)
+max_n = max(counts.values()) if counts else 1
+ramp  = ["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"]
+
+def bucket_colour(n):
+    idx = min(len(ramp) - 1, int((n - 1) / max_n * len(ramp)))
+    return ramp[idx]
+
+edges = [int(math.ceil((i + 1) / len(ramp) * max_n)) for i in range(len(ramp))]
+legend = []
+prev = 1
+for i, edge in enumerate(edges):
+    if edge < prev:
+        continue
+    legend.append({
+        "colour": ramp[i],
+        "label": f"{prev}" if edge == prev else f"{prev}–{edge}",
+    })
+    prev = edge + 1
+
+features = [{
+    "polygon": hex_polygon(q, r, HEX_SIZE_DEG),
+    "count":   n,
+    "color":   bucket_colour(n),
+} for (q, r), n in counts.items()]
+
+print(f"✓ {len(features)} non-empty hex cells "
+      f"(max count per cell: {max_n}, total items binned: {len(points)})")
+
+centre_lat = geo["latitude"].mean()
+centre_lon = geo["longitude"].mean()
+payload = json.dumps({"features": features, "legend": legend,
+                      "centre": [float(centre_lat), float(centre_lon)]})
+
+map_id   = f"hogbacks-hex-{uuid.uuid4().hex[:8]}"
+data_var = f"__hogbackHex_{map_id.replace('-', '_')}"
+
+html = f"""
+<div id="{map_id}" style="height:560px;width:100%;border:1px solid #ddd;
+     border-radius:4px;position:relative"></div>
+<link rel="stylesheet"
+      href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet"
+      href="https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.css" />
+<script>window["{data_var}"] = {payload};</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+    const mapId  = "{map_id}";
+    const data   = window["{data_var}"];
+
+    function loadFullscreen(cb) {{
+        if (typeof L !== 'undefined' && L.control && L.control.fullscreen) return cb();
+        if (typeof L === 'undefined') return setTimeout(() => loadFullscreen(cb), 50);
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.js';
+        s.onload = cb;
+        s.onerror = cb;
+        document.head.appendChild(s);
+    }}
+
+    let attempts = 0;
+    function init() {{
+        const el = document.getElementById(mapId);
+        if (!el || typeof L === 'undefined') return setTimeout(init, 50);
+        if (el._leaflet_id) return;
+        const hasFullscreen = !!(L.control && L.control.fullscreen);
+        if (!hasFullscreen && attempts < 40) {{ attempts++; return setTimeout(init, 50); }}
+
+        const osm = L.tileLayer(
+            'https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
+            {{ maxZoom: 19,
+               attribution: '&copy; OpenStreetMap contributors' }}
+        );
+        const esriTer = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{{z}}/{{y}}/{{x}}',
+            {{ maxZoom: 13,
+               attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA' }}
+        );
+
+        const hexLayer = L.layerGroup();
+        for (const f of data.features) {{
+            L.polygon(f.polygon, {{
+                color: '#555', weight: 0.7,
+                fillColor: f.color, fillOpacity: 0.72
+            }}).bindTooltip(
+                '<b>' + f.count + '</b> hogback' + (f.count !== 1 ? 's' : ''),
+                {{ sticky: true }}
+            ).addTo(hexLayer);
+        }}
+
+        const mapOpts = {{
+            center: data.centre, zoom: 6,
+            layers: [osm, hexLayer]
+        }};
+        if (hasFullscreen) {{
+            mapOpts.fullscreenControl = true;
+            mapOpts.fullscreenControlOptions = {{ position: 'topleft' }};
+        }}
+        const map = L.map(mapId, mapOpts);
+
+        L.control.layers(
+            {{ 'OpenStreetMap': osm, 'Esri World Terrain': esriTer }},
+            {{ 'Hex density': hexLayer }},
+            {{ collapsed: true }}
+        ).addTo(map);
+
+        const legendCtl = L.control({{ position: 'bottomright' }});
+        legendCtl.onAdd = function() {{
+            const div = L.DomUtil.create('div', 'hex-legend');
+            div.style.background = 'rgba(255,255,255,0.92)';
+            div.style.padding = '6px 10px';
+            div.style.borderRadius = '4px';
+            div.style.font = '12px/1.4 sans-serif';
+            div.style.boxShadow = '0 1px 3px rgba(0,0,0,0.15)';
+            let html = '<b>Hogbacks per hex</b><br>';
+            for (const b of data.legend) {{
+                html += '<span style="display:inline-block;width:14px;height:14px;'
+                     + 'background:' + b.colour + ';border:1px solid #999;'
+                     + 'margin-right:6px;vertical-align:middle"></span>'
+                     + b.label + '<br>';
+            }}
+            div.innerHTML = html;
+            return div;
+        }};
+        legendCtl.addTo(map);
+
+        setTimeout(() => map.invalidateSize(), 200);
+    }}
+    loadFullscreen(init);
+}})();
+</script>
+"""
+
+class _Html:
+    def __init__(self, s): self._s = s
+    def _repr_html_(self): return self._s
+_Html(html)
+```
+
+### Step 3c — Items per site
+
+Williams (2015) and earlier surveys point to three or four locations
+as the "core" of hogback production and use: Brompton, Lythe and
+Sockburn-on-Tees in northern England, with a further concentration
+at Govan in southern Scotland. If the dataset is well-modelled, a
+simple `GROUP BY site` over the item labels should reproduce that
+shape. The site names below are extracted from labels with the regex
+from Step 2 — so the *particular* counts depend on a string trick,
+but the *shape* of the distribution does not.
+
+```{pyodide}
+#| label: bar-sites
+#| autorun: false
+import matplotlib.pyplot as plt
+
+assert 'df' in dir() and not df.empty, "⚠ Please run the data-loading cell first."
+
+site_counts = df.groupby("site").size().sort_values(ascending=False)
+
+print(f"Sites with 2+ hogback items: "
+      f"{(site_counts >= 2).sum()}   "
+      f"(accounting for {site_counts[site_counts >= 2].sum()} of {len(df)} items)")
+print(f"Singleton sites:            "
+      f"{(site_counts == 1).sum()}")
+print()
+
+# Show top-15 for the chart; the long tail of singletons gets a summary row.
+top_n = 15
+top  = site_counts.head(top_n)
+rest = site_counts.iloc[top_n:]
+
+fig, ax = plt.subplots(figsize=(8, 5))
+labels = list(top.index)
+values = list(top.values)
+if len(rest) > 0:
+    labels.append(f"(+ {len(rest)} other sites, 1 item each)")
+    values.append(rest.sum())
+colours = ["#1f4e79"] * top_n + (["#9ab6d6"] if len(rest) > 0 else [])
+
+ax.barh(labels, values, color=colours[:len(labels)])
+ax.set_xlabel("number of hogback items in Wikidata")
+ax.set_title("Hogback items grouped by site")
+ax.invert_yaxis()
+for i, v in enumerate(values):
+    ax.text(v + 0.1, i, str(int(v)), va="center", fontsize=9)
+plt.tight_layout()
+plt.show()
+```
+
+### Step 3d — Completeness of cross-references
+
+How much of the auxiliary Wikidata information is actually present
+on these items? As with the holy wells, this is the question a data
+steward asks before drawing quantitative conclusions from a
+citizen-science dataset.
+
+```{pyodide}
+#| label: bar-completeness
+#| autorun: false
+import matplotlib.pyplot as plt
+
+assert 'df' in dir() and not df.empty, "⚠ Please run the data-loading cell first."
+
+completeness = {
+    "has coordinates (P625)":        df["latitude"].notna().sum(),
+    "has Commons image (P18)":       df["img"].notna().sum(),
+    "has OSM node ID (P11693)":      df["osmnode"].notna().sum(),
+    "has all three":                 (
+        df["latitude"].notna() &
+        df["img"].notna() &
+        df["osmnode"].notna()
+    ).sum(),
+    "total hogback items":           len(df),
+}
+
+for k, v in completeness.items():
+    pct = 100 * v / len(df)
+    print(f"  {k:28s} {v:3d}   ({pct:5.1f}%)")
+
+fig, ax = plt.subplots(figsize=(7, 3.2))
+keys = list(completeness.keys())
+vals = [completeness[k] for k in keys]
+ax.barh(keys, vals, color=["#4C72B0","#55A868","#C44E52","#8172B2","#CCB974"])
+ax.set_xlabel("number of items")
+ax.set_title("Completeness of Wikidata cross-references")
+ax.invert_yaxis()
+for i, v in enumerate(vals):
+    ax.text(v + 0.1, i, str(v), va="center", fontsize=9)
+plt.tight_layout()
+plt.show()
+```
+
+## Step 4 — Explore
+
+The DataFrame `df` stays in scope. One starting point: list all
+items at a specific site.
+
+```{pyodide}
+#| label: explore-site
+#| autorun: false
+SITE = "Brompton"   # try: "Lythe", "Sockburn", "Govan", "Gosforth", "Penrith"
+
+assert 'df' in dir() and not df.empty, "⚠ Please run the data-loading cell first."
+sub = df[df["site"].str.contains(SITE, case=False, na=False)]
+print(f"{len(sub)} hogback items at sites matching {SITE!r}:\n")
+for _, row in sub.iterrows():
+    lat_lon = (f"({row['latitude']:.3f}, {row['longitude']:.3f})"
+               if pd.notna(row["latitude"]) else "(no coords)")
+    print(f"  {row['itemLabel']:40s}  {lat_lon:22s}  {row['qid']}")
+```
+
+---
+
+*Part of an Open Educational Resource series on knowledge graphs
+and linked open data, produced in the context of
+[NFDI4Objects](https://www.nfdi4objects.net/). Data: Wikidata
+[WikiProject Hogback](https://www.wikidata.org/wiki/Wikidata:WikiProject_Hogback),
+CC0. Tiles: OpenStreetMap contributors, Esri. Images: Wikimedia
+Commons contributors. Archaeological background follows Williams,
+H. 2015, 'Hogbacks: the Materiality of Solid Spaces' in* Early
+Medieval Stone Monuments: Materiality, Biography, Landscape,
+*Boydell, pp. 241–68.*
