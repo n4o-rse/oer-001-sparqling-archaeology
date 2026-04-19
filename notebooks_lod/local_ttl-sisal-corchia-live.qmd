@@ -1,0 +1,376 @@
+---
+title: "Speleothem isotope records from a local Turtle file: Antro del Corchia"
+format: live-html
+engine: knitr
+resources:
+  - sisal_145_corchia_data.ttl
+pyodide:
+  packages:
+    - pandas
+    - matplotlib
+    - numpy
+    - scipy
+---
+
+{{< include ../_extensions/r-wasm/live/_knitr.qmd >}}
+
+## About this notebook
+
+This notebook reads a local RDF/Turtle export of the δ18O and δ13C
+observations from **Antro del Corchia** (SISAL site 145, Apuan Alps,
+Italy), parses it with `rdflib`, and plots the isotope records against
+calendar age, with Marine Isotope Stage (MIS) bands drawn as the
+climatological backdrop.
+
+Everything runs in your browser via Pyodide — `rdflib`, `pandas`,
+`matplotlib`, `scipy` — no Python installation and no SPARQL endpoint.
+The TTL file sits next to this page and is loaded into Pyodide's
+virtual filesystem at startup.
+
+::: {.callout-tip title="Source and attribution"}
+Data: **SISALv3** —
+[Kaushal et al. 2024, *Earth Syst. Sci. Data* 16, 1933–1963](https://doi.org/10.5194/essd-16-1933-2024) ·
+database DOI [10.5287/ora-2nanwp4rk](https://doi.org/10.5287/ora-2nanwp4rk).
+RDF conversion, Savitzky–Golay smoothing, and the MIS-band plotting
+conventions: the
+[GeoScience-FAIRification-LOD](https://github.com/Research-Squirrel-Engineers/GeoScience-FAIRification-LOD)
+repository by the Research Squirrel Engineers. The TTL snapshot used
+here was produced by
+[`plot_sisal_from_csv.py`](https://github.com/Research-Squirrel-Engineers/GeoScience-FAIRification-LOD/blob/main/SISAL/plot_sisal_from_csv.py)
+in that repository, which also ships static `.svg`/`.jpg` plots of
+the records shown below.
+:::
+
+### Why this dataset?
+
+Corchia is one of the longer and better-dated speleothem records in
+SISALv3: four separate stalagmites (SISAL entity IDs 665, 667, 668,
+670) covering parts of the last glacial cycle and the Holocene
+(~2.5–140 ka BP), with paired δ18O and δ13C measurements (~1,200 of
+each). That makes it a rewarding teaching dataset: long enough to
+cross several glacial–interglacial boundaries, short enough to plot
+fluently in the browser, and with two proxies side by side so the
+δ18O (hydroclimate) vs. δ13C (vegetation / soil CO₂) contrast
+becomes visible.
+
+### What you'll learn
+
+- How to load a static TTL file into Pyodide via Quarto's
+  `resources:` frontmatter and parse it with `rdflib`
+- How to write SPARQL against an in-memory graph to pull out
+  paired proxy observations and their pre-computed smoothed values
+- How to overlay Marine Isotope Stage bands on a time axis using
+  `matplotlib.axhspan` — the standard palaeoclimate convention of
+  age increasing downwards on the y-axis
+
+### Data-context notes
+
+- **Age convention.** `geolod:ageKaBP` stores calendar age in
+  *thousands of years before present* (ka BP). The axis is
+  conventionally drawn with the *present at the top* and deeper
+  time below — `ax.invert_yaxis()` after setting limits.
+- **Pre-computed smoothing.** The RDF already carries two smoothed
+  variants per observation — an 11-point rolling median
+  (`geolod:smoothedValue_rollingMedian`) and a Savitzky–Golay
+  filter (`geolod:smoothedValue_savgol`, w=11, polyorder=2). We
+  plot the raw values in faded grey and the Savitzky–Golay
+  smoother on top in black, mirroring the EPICA-style layout used
+  by the upstream repository.
+- **Four entities, one cave.** A single cave can host multiple
+  stalagmites, and Corchia has four: SISAL `entity_id` 665, 667,
+  668, 670. We colour them separately so the overlap and
+  complementarity of their age ranges becomes visible. Treating
+  all four as a single undifferentiated series would wash that
+  out.
+- **Proxy interpretation (short version).** δ18O of speleothem
+  calcite tracks the isotopic composition of drip water, which
+  depends on rainfall source, amount, and temperature. δ13C
+  reflects soil CO₂ (vegetation density, biological activity) and
+  prior calcite precipitation. They are not redundant: δ18O is
+  broadly climate-driven, δ13C is more sensitive to the
+  karst–vegetation system above the cave.
+
+### Tooling notes
+
+`rdflib` is not pre-bundled in Pyodide, so we install it via
+`micropip`. Plotting uses the standard `matplotlib` stack, which
+*is* pre-bundled. A full local-runtime companion exists as
+[`plot_sisal_from_csv.py`](https://github.com/Research-Squirrel-Engineers/GeoScience-FAIRification-LOD/blob/main/SISAL/plot_sisal_from_csv.py)
+in the SISAL FAIRification repository, which is also the script
+that produced the TTL snapshot used here.
+
+::: {.callout-note}
+On first load, your browser downloads the Python runtime (Pyodide,
+~10 MB) and fetches the ~1.6 MB TTL file into its virtual filesystem.
+Please allow a moment for both to initialise.
+:::
+
+## 1  Setup, data loading, and SPARQL query
+
+The `resources:` entry in the frontmatter tells `quarto-live` to copy
+`sisal_145_corchia_data.ttl` into Pyodide's VFS, where it is readable
+as an ordinary file at the notebook's working directory. One cell
+handles everything from here to a clean DataFrame: install `rdflib`,
+parse the graph, run one SPARQL query that pulls both the δ18O and
+δ13C observations together with their pre-computed Savitzky–Golay
+smoothed values and the `entity_id` of the parent speleothem, and
+project the bindings into `pandas`. We route the observation-type URI
+into a short label (`d18O` / `d13C`) so downstream plotting can iterate
+over both proxies cleanly.
+
+```{pyodide}
+#| label: load-and-query
+#| autorun: false
+import micropip
+await micropip.install("rdflib")
+
+import re
+import pandas as pd
+from rdflib import Graph
+
+g = Graph()
+g.parse("sisal_145_corchia_data.ttl", format="turtle")
+print(f"Parsed {len(g):,} triples from sisal_145_corchia_data.ttl")
+
+OBS_QUERY = """
+PREFIX rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs:  <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX sosa:  <http://www.w3.org/ns/sosa/>
+PREFIX geolod: <http://w3id.org/geo-lod/>
+
+SELECT ?obs ?obsType ?speleothem ?ageKaBP ?value ?smSavgol
+WHERE {
+    ?obs rdf:type ?obsType ;
+         sosa:hasFeatureOfInterest ?speleothem ;
+         geolod:ageKaBP ?ageKaBP ;
+         geolod:measuredValue ?value .
+    OPTIONAL { ?obs geolod:smoothedValue_savgol ?smSavgol }
+    FILTER(?obsType IN (geolod:Delta18OSpeleothemObservation,
+                        geolod:Delta13CSpeleothemObservation))
+}
+"""
+
+_TYPE_TO_PROXY = {
+    "Delta18OSpeleothemObservation": "d18O",
+    "Delta13CSpeleothemObservation": "d13C",
+}
+_ENT_RE = re.compile(r"_e(\d+)$")
+
+def _short_type(uri):
+    return _TYPE_TO_PROXY.get(str(uri).rsplit("/", 1)[-1], str(uri))
+
+def _entity_id(uri):
+    m = _ENT_RE.search(str(uri))
+    return int(m.group(1)) if m else -1
+
+rows = [{
+    "proxy":     _short_type(r["obsType"]),
+    "entity":    _entity_id(r["speleothem"]),
+    "age_ka":    float(r["ageKaBP"]),
+    "value":     float(r["value"]),
+    "smSavgol":  float(r["smSavgol"]) if r["smSavgol"] is not None else None,
+} for r in g.query(OBS_QUERY)]
+
+df = pd.DataFrame(rows).sort_values(["proxy", "entity", "age_ka"]).reset_index(drop=True)
+
+print(f"Observations: {len(df):,}")
+print(f"Proxies:      {sorted(df['proxy'].unique())}")
+print(f"Entities:     {sorted(df['entity'].unique())}")
+print(f"Age range:    {df['age_ka'].min():.1f} – {df['age_ka'].max():.1f} ka BP")
+print()
+print(df.groupby(["proxy", "entity"]).agg(
+    n=("value", "size"),
+    age_min_ka=("age_ka", "min"),
+    age_max_ka=("age_ka", "max"),
+    val_min=("value", "min"),
+    val_max=("value", "max"),
+).round(2))
+```
+
+## 2a  Sanity check — a simple scatter per proxy
+
+Before styling anything, plot both proxies against age with age
+increasing downwards. If the distributions look right and the
+age windows line up with the speleothem entities you expect, the
+ingest is fine.
+
+```{pyodide}
+#| label: plot-sanity
+#| autorun: false
+import matplotlib.pyplot as plt
+
+assert 'df' in dir() and not df.empty, "⚠ Run the data-loading cell first."
+
+fig, axes = plt.subplots(1, 2, figsize=(10, 6), sharey=True)
+for ax, proxy, xlabel in zip(axes, ["d18O", "d13C"],
+                              [r"$\delta^{18}$O (‰ VPDB)",
+                               r"$\delta^{13}$C (‰ VPDB)"]):
+    sub = df[df["proxy"] == proxy]
+    ax.scatter(sub["value"], sub["age_ka"], s=3, alpha=0.5, c="#1f77b4")
+    ax.set_xlabel(xlabel)
+    ax.set_title(f"Corchia – {proxy}  (n = {len(sub):,})")
+    ax.grid(True, alpha=0.3)
+
+axes[0].set_ylabel("Age (ka BP)")
+axes[0].invert_yaxis()  # sharey means both axes are flipped
+fig.suptitle("Sanity check: all observations, no smoothing", y=1.00)
+fig.tight_layout()
+plt.show()
+```
+
+## 2b  Isotope records with MIS bands
+
+The classic palaeoclimate layout: age on the y-axis (present at the
+top), δ18O and δ13C as two panels side by side, speleothem entities
+coloured separately, and the Marine Isotope Stage chronology drawn
+as coloured bands behind the data. The Savitzky–Golay smoother
+cleans up high-frequency noise without smearing glacial–interglacial
+transitions.
+
+```{pyodide}
+#| label: plot-mis
+#| autorun: false
+import matplotlib.pyplot as plt
+import matplotlib.transforms as transforms
+
+assert 'df' in dir() and not df.empty, "⚠ Run the data-loading cell first."
+
+# ── Marine Isotope Stages (LR04 boundaries, ka BP) ──────────────────────────
+MIS_COLOUR = {"warm": "#fddbc7", "inter": "#fef0e6", "cold": "#d6e8f7"}
+MIS_LABEL_COLOUR = {"warm": "#8b1a00", "inter": "#8b1a00", "cold": "#003f6b"}
+MIS_INTERVALS = [
+    (0, 14, "MIS 1", "warm"), (14, 29, "MIS 2", "cold"),
+    (29, 57, "MIS 3", "inter"), (57, 71, "MIS 4", "cold"),
+    (71, 130, "MIS 5", "warm"), (130, 191, "MIS 6", "cold"),
+    (191, 243, "MIS 7", "warm"), (243, 300, "MIS 8", "cold"),
+    (300, 337, "MIS 9", "warm"), (337, 374, "MIS 10", "cold"),
+    (374, 424, "MIS 11", "warm"),
+]
+
+def draw_mis_bands(ax, y_lo, y_hi):
+    trans = transforms.blended_transform_factory(ax.transAxes, ax.transData)
+    for top, bot, label, kind in MIS_INTERVALS:
+        if bot < y_lo or top > y_hi:
+            continue
+        ax.axhspan(top, bot, facecolor=MIS_COLOUR[kind], alpha=1.0, zorder=0)
+        y_mid = (max(top, y_lo) + min(bot, y_hi)) / 2.0
+        ax.text(0.99, y_mid, label, transform=trans,
+                ha="right", va="center", fontsize=8, fontweight="bold",
+                color=MIS_LABEL_COLOUR[kind], zorder=2)
+
+# ── One entity → one colour ─────────────────────────────────────────────────
+ENTITY_COLOURS = {665: "#1f77b4", 667: "#d62728", 668: "#2ca02c", 670: "#9467bd"}
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 10), sharey=True)
+
+for ax, proxy, xlabel in zip(axes, ["d18O", "d13C"],
+                              [r"$\delta^{18}$O (‰ VPDB)",
+                               r"$\delta^{13}$C (‰ VPDB)"]):
+    sub = df[df["proxy"] == proxy]
+    age_lo, age_hi = sub["age_ka"].min(), sub["age_ka"].max()
+    val_lo, val_hi = sub["value"].min(), sub["value"].max()
+
+    draw_mis_bands(ax, age_lo, age_hi)
+
+    # Raw values (faded) and Savitzky–Golay smoother (bold), one entity at a time
+    for ent_id, grp in sub.groupby("entity"):
+        col = ENTITY_COLOURS.get(ent_id, "#555555")
+        grp = grp.sort_values("age_ka")
+        ax.plot(grp["value"], grp["age_ka"],
+                color=col, alpha=0.25, linewidth=0.6, zorder=2)
+        sm = grp.dropna(subset=["smSavgol"])
+        if not sm.empty:
+            ax.plot(sm["smSavgol"], sm["age_ka"],
+                    color=col, linewidth=1.5, zorder=3,
+                    label=f"entity {ent_id}  (n = {len(grp):,})")
+
+    # Margin on x-axis so labels don't collide with MIS tags
+    pad = (val_hi - val_lo) * 0.05
+    ax.set_xlim(val_lo - pad, val_hi + pad)
+    ax.xaxis.tick_top()
+    ax.xaxis.set_label_position("top")
+    ax.set_xlabel(xlabel, fontsize=11, labelpad=8)
+    ax.grid(axis="y", alpha=0.25, zorder=1)
+    ax.legend(loc="lower left", fontsize=8, framealpha=0.9)
+
+axes[0].set_ylabel("Age (ka BP)", fontsize=11)
+axes[0].invert_yaxis()
+fig.suptitle("SISAL site 145 — Antro del Corchia\n"
+             "δ18O and δ13C vs. age, Savitzky–Golay (w=11, polyorder=2)",
+             y=0.995, fontsize=12, fontweight="bold")
+fig.tight_layout()
+plt.show()
+```
+
+## 3  Explore
+
+The full DataFrame is in scope. A few starting points for your own
+experiments:
+
+```{pyodide}
+#| label: explore-window
+#| autorun: false
+# Zoom to the last glacial–interglacial cycle (0–140 ka BP)
+import matplotlib.pyplot as plt
+
+window = df[df["age_ka"].between(0, 140)]
+fig, ax = plt.subplots(figsize=(7, 6))
+for ent_id, grp in window[window["proxy"] == "d18O"].groupby("entity"):
+    grp = grp.sort_values("age_ka")
+    ax.plot(grp["value"], grp["age_ka"],
+            alpha=0.3, linewidth=0.6,
+            color=ENTITY_COLOURS.get(ent_id, "#555"))
+    sm = grp.dropna(subset=["smSavgol"])
+    if not sm.empty:
+        ax.plot(sm["smSavgol"], sm["age_ka"],
+                linewidth=1.5, label=f"entity {ent_id}",
+                color=ENTITY_COLOURS.get(ent_id, "#555"))
+ax.set_ylim(140, 0)
+ax.xaxis.tick_top(); ax.xaxis.set_label_position("top")
+ax.set_xlabel(r"$\delta^{18}$O (‰ VPDB)")
+ax.set_ylabel("Age (ka BP)")
+ax.set_title("Corchia δ18O — last glacial cycle")
+ax.grid(alpha=0.3)
+ax.legend(loc="lower left", fontsize=8)
+plt.show()
+```
+
+```{pyodide}
+#| label: explore-entity-overlap
+#| autorun: false
+# Which entities overlap in time, and by how much?
+ranges = df.groupby("entity").agg(
+    n=("value", "size"),
+    age_min_ka=("age_ka", "min"),
+    age_max_ka=("age_ka", "max"),
+).round(1).sort_values("age_min_ka")
+ranges["span_ka"] = (ranges["age_max_ka"] - ranges["age_min_ka"]).round(1)
+ranges
+```
+
+```{pyodide}
+#| label: explore-custom
+#| autorun: false
+# Hier anpassen: filter the DataFrame yourself
+# Example — quick Pearson correlation of δ18O vs δ13C on shared ages
+import pandas as pd
+paired = df.pivot_table(index=["entity", "age_ka"],
+                        columns="proxy", values="value").dropna()
+print(f"Paired observations: {len(paired)}")
+print(f"Pearson r(d18O, d13C) = {paired['d18O'].corr(paired['d13C']):.3f}")
+print()
+print("Per entity:")
+for ent, sub in paired.groupby(level="entity"):
+    if len(sub) > 10:
+        print(f"  entity {ent}: r = {sub['d18O'].corr(sub['d13C']):.3f}  "
+              f"(n = {len(sub):,})")
+```
+
+---
+
+*Part of an Open Educational Resource series on knowledge graphs and
+linked open data, produced in the context of
+[NFDI4Objects](https://www.nfdi4objects.net/). Data source:
+[Kaushal et al. 2024, SISALv3](https://doi.org/10.5194/essd-16-1933-2024);
+RDF conversion and plotting conventions adapted from
+[Research-Squirrel-Engineers/GeoScience-FAIRification-LOD](https://github.com/Research-Squirrel-Engineers/GeoScience-FAIRification-LOD).*

@@ -1,0 +1,622 @@
+---
+title: "Mapping SISAL cave sites from a local Turtle file"
+format: live-html
+engine: knitr
+resources:
+  - sisal_sites.ttl
+pyodide:
+  packages:
+    - pandas
+---
+
+{{< include ../_extensions/r-wasm/live/_knitr.qmd >}}
+
+## About this notebook
+
+This notebook reads a local RDF/Turtle snapshot of the
+**SISALv3 cave site catalogue** (305 caves with geographic coordinates),
+parses it with `rdflib`, and produces two interactive Leaflet maps:
+
+1. a marker map with every cave, colour-coded by archaeological status
+   (plain speleothem site vs. confirmed archaeological cave site), and
+2. a country-level choropleth that shows how the 305 SISAL caves
+   distribute across the world's countries.
+
+Everything runs in your browser via Pyodide — no Python installation,
+no SPARQL endpoint. The TTL file sits next to this page and is loaded
+into Pyodide's virtual filesystem at startup; the country boundaries
+for the second map are fetched on demand from a public CDN.
+
+::: {.callout-tip title="Source and attribution"}
+Data: **SISALv3** —
+[Kaushal et al. 2024, *Earth Syst. Sci. Data* 16, 1933–1963](https://doi.org/10.5194/essd-16-1933-2024) ·
+database DOI [10.5287/ora-2nanwp4rk](https://doi.org/10.5287/ora-2nanwp4rk).
+RDF conversion and enrichment (archaeological typing, UNESCO flags,
+Wikidata cross-links): the
+[GeoScience-FAIRification-LOD](https://github.com/Research-Squirrel-Engineers/GeoScience-FAIRification-LOD)
+repository by the Research Squirrel Engineers. The TTL snapshot used
+here was produced by
+[`plot_sisal_from_csv.py`](https://github.com/Research-Squirrel-Engineers/GeoScience-FAIRification-LOD/blob/main/SISAL/plot_sisal_from_csv.py)
+in that repository.
+:::
+
+### Why this dataset?
+
+SISAL (Speleothem Isotopes Synthesis and AnaLysis) is a global,
+community-curated compilation of stable isotope records from cave
+carbonates. Version 3 ([Kaushal et al. 2024](https://doi.org/10.5194/essd-16-1933-2024))
+ships with a flat CSV of sites that has been converted to Linked Open
+Data under the `geo-lod` vocabulary. As a teaching dataset it is
+compact, globally distributed, and the archaeological enrichment
+layer (cross-links to Wikidata and UNESCO World Heritage) makes it a
+nice bridge between palaeoclimate and cultural heritage data.
+
+### What you'll learn
+
+- How to load a static TTL file into Pyodide via Quarto's
+  `resources:` frontmatter and parse it with `rdflib`
+- How to write a small SPARQL query against an in-memory `rdflib`
+  graph and turn the bindings into a `pandas` DataFrame
+- Two complementary cartographic idioms for site-level data:
+  coloured markers (every cave individually, categorical colouring)
+  and a country choropleth (aggregated count per country)
+
+### Data-context notes
+
+- **Coordinate convention.** The TTL stores WKT literals as
+  `<http://www.opengis.net/def/crs/EPSG/0/4326> POINT(lon lat)` —
+  note the CRS prefix *and* the `lon lat` axis order mandated by
+  GeoSPARQL. Leaflet, by contrast, expects `[lat, lon]`, so we swap
+  the order once on parse.
+- **Archaeological sub-class.** A subset of sites is typed as
+  `geolod:ArchaeologicalCaveSite` in addition to `geolod:Cave`.
+  Seven sites are flagged as UNESCO World Heritage via
+  `geolod:isUNESCOWorldHeritage`. We expose both categorical layers
+  on the marker map.
+- **Counts vs. samples.** `geolod:countD18OSamples` and
+  `geolod:countD13CSamples` are per-site *observation* counts
+  aggregated across all entities (speleothems) at that site. A
+  single cave can host several speleothems; Corchia (site 145) has
+  four. The country choropleth below counts *sites*, not
+  observations — a country with one very well-sampled cave will
+  therefore look lighter than one with several caves of modest
+  sample size.
+
+### Tooling notes
+
+`rdflib` is not pre-bundled in Pyodide, so we install it via
+`micropip`. The map is built with raw Leaflet rather than `folium`
+because `folium` writes HTML files to disk and relies on the full
+Jinja stack — heavy for a browser runtime. For the country-level
+aggregation we fetch a small Natural Earth GeoJSON (1:110 m scale,
+~270 KB) directly from a CDN and do point-in-polygon counting in
+plain JavaScript — so no `geopandas`, no `shapely`, no pyproj is
+needed inside Python.
+
+A full local-runtime companion (Jupyter + `SPARQLWrapper` + `folium`)
+exists in the [SISAL FAIRification repository](https://github.com/Research-Squirrel-Engineers/GeoScience-FAIRification-LOD),
+which also produced the TTL snapshot used here.
+
+::: {.callout-note}
+On first load, your browser downloads the Python runtime (Pyodide,
+~10 MB) and fetches the ~160 KB TTL file into Pyodide's virtual
+filesystem. The country-choropleth map additionally pulls in
+a ~270 KB GeoJSON from a CDN — all one-off downloads that the
+browser caches.
+:::
+
+## 1  Setup, data loading, and SPARQL query
+
+The `resources:` entry in the frontmatter tells `quarto-live` to copy
+`sisal_sites.ttl` into Pyodide's VFS, where it is readable as an
+ordinary file at the notebook's working directory. One cell handles
+everything from here to a clean DataFrame: install `rdflib`, parse the
+graph, run one SPARQL query for every cave (label, coordinates, sample
+counts, archaeological flags, and — where available — a Wikidata
+identifier), and project the bindings into `pandas`.
+
+```{pyodide}
+#| label: load-and-query
+#| autorun: false
+import micropip
+await micropip.install("rdflib")
+
+import re
+import pandas as pd
+from rdflib import Graph
+
+g = Graph()
+g.parse("sisal_sites.ttl", format="turtle")
+print(f"Parsed {len(g):,} triples from sisal_sites.ttl")
+
+SITES_QUERY = """
+PREFIX rdf:   <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+PREFIX rdfs:  <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX owl:   <http://www.w3.org/2002/07/owl#>
+PREFIX geo:   <http://www.opengis.net/ont/geosparql#>
+PREFIX geolod: <http://w3id.org/geo-lod/>
+
+SELECT ?site ?label ?wkt ?nD18O ?nD13C ?isArch ?archCategory ?isUnesco ?wikidata
+WHERE {
+    ?site a geolod:Cave ;
+          rdfs:label ?label ;
+          geo:hasGeometry/geo:asWKT ?wkt ;
+          geolod:countD18OSamples ?nD18O ;
+          geolod:countD13CSamples ?nD13C .
+    BIND(EXISTS { ?site a geolod:ArchaeologicalCaveSite } AS ?isArch)
+    OPTIONAL { ?site geolod:archaeologicalCategory ?archCategory }
+    BIND(EXISTS { ?site geolod:isUNESCOWorldHeritage true } AS ?isUnesco)
+    OPTIONAL { ?site owl:sameAs ?wikidata
+               FILTER(STRSTARTS(STR(?wikidata), "https://www.wikidata.org/")) }
+}
+ORDER BY ?site
+"""
+
+_WKT_RE = re.compile(r"point\s*\(\s*([-+\d.eE]+)\s+([-+\d.eE]+)\s*\)", re.IGNORECASE)
+
+def parse_wkt(wkt):
+    """Return (lat, lon) for a WKT Point literal, swapping the WKT lon-lat order."""
+    m = _WKT_RE.search(str(wkt) if wkt else "")
+    if not m:
+        return (None, None)
+    try:
+        return (float(m.group(2)), float(m.group(1)))
+    except ValueError:
+        return (None, None)
+
+rows = []
+for r in g.query(SITES_QUERY):
+    lat, lon = parse_wkt(r["wkt"])
+    rows.append({
+        "site":       str(r["site"]).rsplit("/", 1)[-1],
+        "label":      str(r["label"]),
+        "lat":        lat,
+        "lon":        lon,
+        "nD18O":      int(r["nD18O"]),
+        "nD13C":      int(r["nD13C"]),
+        "isArch":     bool(r["isArch"]),
+        "archCategory": str(r["archCategory"]) if r["archCategory"] else "",
+        "isUnesco":   bool(r["isUnesco"]),
+        "wikidata":   str(r["wikidata"]) if r["wikidata"] else "",
+    })
+
+df = pd.DataFrame(rows).dropna(subset=["lat", "lon"]).reset_index(drop=True)
+print(f"Sites with coordinates: {len(df)}")
+print(f"  Archaeological: {df['isArch'].sum()}")
+print(f"  UNESCO World Heritage: {df['isUnesco'].sum()}")
+print(f"  With Wikidata link: {(df['wikidata'] != '').sum()}")
+print(f"  Total δ18O observations: {df['nD18O'].sum():,}")
+print(f"  Total δ13C observations: {df['nD13C'].sum():,}")
+df.head()
+```
+
+## 2a  Marker map — every cave, typed by status
+
+Each cave is plotted as a small circle; colour and layer group
+encode whether it is a plain speleothem site, an archaeological
+cave site, or a UNESCO World Heritage property. The layer control
+doubles as a legend.
+
+```{pyodide}
+#| label: map-markers
+#| autorun: false
+import json, uuid, html
+
+assert 'df' in dir() and not df.empty, "⚠ Run the data-loading cell first."
+
+def _category(row):
+    if row["isUnesco"]:   return "UNESCO World Heritage"
+    if row["isArch"]:     return "Archaeological cave"
+    return "Speleothem site"
+
+df["_category"] = df.apply(_category, axis=1)
+
+CATEGORY_COLOURS = {
+    "Speleothem site":       "#3388ff",
+    "Archaeological cave":   "#e6550d",
+    "UNESCO World Heritage": "#6a3d9a",
+}
+
+markers = []
+for _, row in df.iterrows():
+    popup = (f"<b>{html.escape(row['label'])}</b><br>"
+             f"{html.escape(row['_category'])}<br>"
+             f"δ18O: {int(row['nD18O']):,} · δ13C: {int(row['nD13C']):,}")
+    if row["archCategory"]:
+        popup += f"<br><i>{html.escape(row['archCategory'])}</i>"
+    if row["wikidata"]:
+        popup += f'<br><a href="{row["wikidata"]}" target="_blank">Wikidata ↗</a>'
+    markers.append({
+        "lat":      row["lat"],
+        "lon":      row["lon"],
+        "category": row["_category"],
+        "color":    CATEGORY_COLOURS[row["_category"]],
+        "popup":    popup,
+    })
+
+categories = [{"category": c, "color": CATEGORY_COLOURS[c]}
+              for c in ["Speleothem site", "Archaeological cave", "UNESCO World Heritage"]]
+payload = json.dumps({"markers": markers, "categories": categories})
+
+map_id   = f"sisal-markers-{uuid.uuid4().hex[:8]}"
+data_var = f"__sisalMarkerData_{map_id.replace('-', '_')}"
+
+map_html = f"""
+<div id="{map_id}" style="height:560px;width:100%;border:1px solid #ddd;border-radius:4px"></div>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.css" />
+<script>window["{data_var}"] = {payload};</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+    const mapId = "{map_id}";
+    const data  = window["{data_var}"];
+
+    function loadFullscreen(cb) {{
+        if (typeof L !== 'undefined' && L.control && L.control.fullscreen) return cb();
+        if (typeof L === 'undefined') return setTimeout(() => loadFullscreen(cb), 50);
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.js';
+        s.onload = cb;
+        document.head.appendChild(s);
+    }}
+
+    let attempts = 0;
+    function init() {{
+        const el = document.getElementById(mapId);
+        if (!el || typeof L === 'undefined') return setTimeout(init, 50);
+        if (el._leaflet_id) return;
+        const hasFullscreen = !!(L.control && L.control.fullscreen);
+        if (!hasFullscreen && attempts < 40) {{ attempts++; return setTimeout(init, 50); }}
+
+        const osm = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }});
+        const esriImagery = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 18,
+            attribution: 'Tiles &copy; Esri &mdash; Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community'
+        }});
+        const esriTerrain = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 13,
+            attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA, DeLorme, and NPS'
+        }});
+
+        const categoryLayers = {{}};
+        for (const c of data.categories) categoryLayers[c.category] = L.layerGroup();
+        for (const m of data.markers) {{
+            const radius = m.category === "UNESCO World Heritage" ? 8
+                         : m.category === "Archaeological cave"   ? 7
+                         : 5;
+            const weight = m.category === "Speleothem site" ? 1 : 1.5;
+            L.circleMarker([m.lat, m.lon], {{
+                radius: radius, color: m.color, weight: weight,
+                fillColor: m.color, fillOpacity: 0.75
+            }}).bindPopup(m.popup).addTo(categoryLayers[m.category]);
+        }}
+
+        const initialLayers = [osm];
+        const overlays = {{}};
+        for (const c of data.categories) {{
+            initialLayers.push(categoryLayers[c.category]);
+            const sw = '<span style="display:inline-block;width:10px;height:10px;'
+                + 'background:' + c.color + ';border-radius:50%;'
+                + 'margin-right:6px;vertical-align:middle"></span>';
+            overlays[sw + c.category] = categoryLayers[c.category];
+        }}
+
+        const mapOpts = {{ center: [20, 10], zoom: 2, worldCopyJump: true, layers: initialLayers }};
+        if (hasFullscreen) {{
+            mapOpts.fullscreenControl = true;
+            mapOpts.fullscreenControlOptions = {{ position: 'topleft' }};
+        }}
+        const map = L.map(mapId, mapOpts);
+
+        L.control.layers({{
+            "OpenStreetMap":    osm,
+            "Esri World Imagery": esriImagery,
+            "Esri World Terrain": esriTerrain,
+        }}, overlays, {{ collapsed: true }}).addTo(map);
+
+        setTimeout(() => map.invalidateSize(), 200);
+    }}
+    loadFullscreen(init);
+}})();
+</script>
+"""
+
+class _Html:
+    def __init__(self, s): self._s = s
+    def _repr_html_(self): return self._s
+_Html(map_html)
+```
+
+## 2b  Country choropleth — sampling intensity per country
+
+The aggregate view assigns each cave to a country (via point-in-polygon
+against Natural Earth country boundaries) and colours each country by
+the total number of SISAL caves it contains. Countries without SISAL
+sites are drawn in a neutral grey; countries with sites get a sequential
+ramp (yellow → red). The point-in-polygon counting is done
+client-side in Leaflet — Python only provides the site coordinates,
+Leaflet fetches the country GeoJSON and handles the rest.
+
+```{pyodide}
+#| label: map-choropleth
+#| autorun: false
+import json, uuid
+
+assert 'df' in dir() and not df.empty, "⚠ Run the data-loading cell first."
+
+# Hand site coordinates to JS — country assignment and counting happen there.
+sites = [{"lat": float(row["lat"]), "lon": float(row["lon"]),
+          "label": row["label"]}
+         for _, row in df.iterrows()]
+payload = json.dumps({"sites": sites, "n_sites": len(df)})
+
+map_id   = f"sisal-choropleth-{uuid.uuid4().hex[:8]}"
+data_var = f"__sisalChoroData_{map_id.replace('-', '_')}"
+GEOJSON_URL = ("https://cdn.jsdelivr.net/gh/nvkelso/natural-earth-vector"
+               "@v5.1.2/geojson/ne_110m_admin_0_countries.geojson")
+
+map_html = f"""
+<div id="{map_id}" style="height:560px;width:100%;border:1px solid #ddd;border-radius:4px"></div>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.css" />
+<script>window["{data_var}"] = {payload};</script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+(function() {{
+    const mapId = "{map_id}";
+    const data  = window["{data_var}"];
+    const geojsonUrl = "{GEOJSON_URL}";
+
+    // Ray-casting point-in-polygon for [lon, lat] coords.
+    // Handles multi-ring polygons (outer + holes) and MultiPolygon.
+    function pointInRing(lon, lat, ring) {{
+        let inside = false;
+        for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {{
+            const [xi, yi] = ring[i], [xj, yj] = ring[j];
+            const intersect = ((yi > lat) !== (yj > lat))
+                && (lon < (xj - xi) * (lat - yi) / (yj - yi + 1e-20) + xi);
+            if (intersect) inside = !inside;
+        }}
+        return inside;
+    }}
+    function pointInFeature(lon, lat, feature) {{
+        const g = feature.geometry;
+        if (!g) return false;
+        const polys = g.type === "Polygon" ? [g.coordinates]
+                    : g.type === "MultiPolygon" ? g.coordinates
+                    : null;
+        if (!polys) return false;
+        for (const poly of polys) {{
+            if (!pointInRing(lon, lat, poly[0])) continue;   // outer ring
+            let inHole = false;
+            for (let h = 1; h < poly.length; h++) {{
+                if (pointInRing(lon, lat, poly[h])) {{ inHole = true; break; }}
+            }}
+            if (!inHole) return true;
+        }}
+        return false;
+    }}
+
+    // Quick bounding-box prefilter to avoid O(N·M) on every site
+    function featureBbox(feature) {{
+        const g = feature.geometry;
+        let minX =  Infinity, minY =  Infinity, maxX = -Infinity, maxY = -Infinity;
+        const walk = ring => {{ for (const [x, y] of ring) {{
+            if (x < minX) minX = x; if (x > maxX) maxX = x;
+            if (y < minY) minY = y; if (y > maxY) maxY = y;
+        }} }};
+        if (g.type === "Polygon")       for (const r of g.coordinates) walk(r);
+        else if (g.type === "MultiPolygon") for (const p of g.coordinates) for (const r of p) walk(r);
+        return [minX, minY, maxX, maxY];
+    }}
+
+    function loadFullscreen(cb) {{
+        if (typeof L !== 'undefined' && L.control && L.control.fullscreen) return cb();
+        if (typeof L === 'undefined') return setTimeout(() => loadFullscreen(cb), 50);
+        const s = document.createElement('script');
+        s.src = 'https://unpkg.com/leaflet.fullscreen@3.0.2/Control.FullScreen.js';
+        s.onload = cb;
+        document.head.appendChild(s);
+    }}
+
+    let attempts = 0;
+    function init() {{
+        const el = document.getElementById(mapId);
+        if (!el || typeof L === 'undefined') return setTimeout(init, 50);
+        if (el._leaflet_id) return;
+        const hasFullscreen = !!(L.control && L.control.fullscreen);
+        if (!hasFullscreen && attempts < 40) {{ attempts++; return setTimeout(init, 50); }}
+
+        const osm = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }});
+        const esriTerrain = L.tileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/World_Terrain_Base/MapServer/tile/{{z}}/{{y}}/{{x}}', {{
+            maxZoom: 13,
+            attribution: 'Tiles &copy; Esri &mdash; Source: USGS, Esri, TANA, DeLorme, and NPS'
+        }});
+
+        const mapOpts = {{ center: [20, 10], zoom: 2, worldCopyJump: true, layers: [osm] }};
+        if (hasFullscreen) {{
+            mapOpts.fullscreenControl = true;
+            mapOpts.fullscreenControlOptions = {{ position: 'topleft' }};
+        }}
+        const map = L.map(mapId, mapOpts);
+
+        // Loading indicator while GeoJSON is in flight
+        const loading = L.control({{ position: 'topright' }});
+        loading.onAdd = () => {{
+            const div = L.DomUtil.create('div');
+            div.style.cssText = 'background:rgba(255,255,255,0.95);padding:6px 10px;'
+                + 'border-radius:4px;box-shadow:0 1px 4px rgba(0,0,0,0.2);'
+                + 'font-size:12px;font-family:sans-serif';
+            div.innerHTML = '⏳ Loading country boundaries…';
+            return div;
+        }};
+        loading.addTo(map);
+
+        fetch(geojsonUrl).then(r => r.json()).then(geojson => {{
+            // Count sites per country feature
+            const bboxes = geojson.features.map(featureBbox);
+            const counts = new Array(geojson.features.length).fill(0);
+            for (const s of data.sites) {{
+                for (let i = 0; i < geojson.features.length; i++) {{
+                    const [minX, minY, maxX, maxY] = bboxes[i];
+                    if (s.lon < minX || s.lon > maxX || s.lat < minY || s.lat > maxY) continue;
+                    if (pointInFeature(s.lon, s.lat, geojson.features[i])) {{
+                        counts[i]++;
+                        break;
+                    }}
+                }}
+            }}
+            const maxN = Math.max(1, ...counts);
+
+            const ramp = ["#ffffb2", "#fecc5c", "#fd8d3c", "#f03b20", "#bd0026"];
+            const rampIdx = n => Math.min(ramp.length - 1,
+                Math.floor((n - 1) / Math.max(maxN - 1, 1) * (ramp.length - 1)));
+
+            // Inject counts into feature properties for styling + tooltip
+            geojson.features.forEach((f, i) => {{
+                f.properties._siteCount = counts[i];
+                f.properties._fill = counts[i] > 0 ? ramp[rampIdx(counts[i])] : "#e8e8e8";
+            }});
+
+            const layer = L.geoJSON(geojson, {{
+                style: f => ({{
+                    fillColor: f.properties._fill,
+                    color: "#666", weight: 0.5,
+                    fillOpacity: f.properties._siteCount > 0 ? 0.75 : 0.35,
+                }}),
+                onEachFeature: (f, lyr) => {{
+                    const n = f.properties._siteCount;
+                    const name = f.properties.NAME || f.properties.ADMIN || "?";
+                    if (n > 0) {{
+                        lyr.bindTooltip(
+                            "<b>" + name + "</b><br>" + n + " SISAL site" + (n !== 1 ? "s" : ""),
+                            {{ sticky: true }}
+                        );
+                    }} else {{
+                        lyr.bindTooltip(name + " (no SISAL sites)", {{ sticky: true }});
+                    }}
+                }},
+            }}).addTo(map);
+
+            loading.remove();
+
+            // ── Build legend bins from actual max count ─────────────────────
+            const step = Math.max((maxN - 1) / ramp.length, 1);
+            const bins = ramp.map((col, i) => {{
+                const lo = Math.floor(1 + i * step);
+                const hi = i < ramp.length - 1
+                    ? Math.floor(1 + (i + 1) * step) - 1
+                    : maxN;
+                return {{ color: col, label: lo === hi ? String(lo) : (lo + "–" + hi) }};
+            }});
+
+            const legend = L.control({{ position: 'bottomright' }});
+            legend.onAdd = () => {{
+                const div = L.DomUtil.create('div');
+                div.style.cssText = 'background:rgba(255,255,255,0.92);padding:8px 10px;'
+                    + 'border-radius:4px;box-shadow:0 1px 4px rgba(0,0,0,0.2);'
+                    + 'font-size:12px;line-height:1.5;font-family:sans-serif';
+                let html = '<div style="font-weight:bold;margin-bottom:4px">Sites per country</div>';
+                html += '<div><span style="display:inline-block;width:14px;height:14px;'
+                     + 'background:#e8e8e8;border:1px solid #666;opacity:0.6;'
+                     + 'margin-right:6px;vertical-align:middle"></span>none</div>';
+                for (const b of bins) {{
+                    html += '<div><span style="display:inline-block;width:14px;height:14px;'
+                         + 'background:' + b.color + ';border:1px solid #666;'
+                         + 'margin-right:6px;vertical-align:middle"></span>' + b.label + '</div>';
+                }}
+                html += '<div style="margin-top:4px;color:#666;font-size:11px">n = '
+                     + data.n_sites + ' sites in '
+                     + counts.filter(c => c > 0).length + ' countries</div>';
+                div.innerHTML = html;
+                return div;
+            }};
+            legend.addTo(map);
+
+            L.control.layers({{
+                "OpenStreetMap":      osm,
+                "Esri World Terrain": esriTerrain,
+            }}, {{ "SISAL sites by country": layer }}, {{ collapsed: true }}).addTo(map);
+        }}).catch(err => {{
+            loading.remove();
+            const errCtl = L.control({{ position: 'topright' }});
+            errCtl.onAdd = () => {{
+                const div = L.DomUtil.create('div');
+                div.style.cssText = 'background:#fdd;padding:8px 10px;border-radius:4px;'
+                    + 'font-size:12px;font-family:sans-serif;max-width:280px';
+                div.innerHTML = '⚠ Failed to load country boundaries: ' + err.message;
+                return div;
+            }};
+            errCtl.addTo(map);
+        }});
+
+        setTimeout(() => map.invalidateSize(), 200);
+    }}
+    loadFullscreen(init);
+}})();
+</script>
+"""
+
+class _Html:
+    def __init__(self, s): self._s = s
+    def _repr_html_(self): return self._s
+_Html(map_html)
+```
+
+## 3  Explore
+
+The full DataFrame is in scope — pick any dimension and aggregate or
+filter. A few starting points:
+
+```{pyodide}
+#| label: explore-by-region
+#| autorun: false
+# Top 10 sites by total isotope observations
+top = df.assign(nTotal=df["nD18O"] + df["nD13C"]) \
+        .sort_values("nTotal", ascending=False)[
+            ["label", "lat", "lon", "nD18O", "nD13C", "nTotal", "isArch", "isUnesco"]
+        ].head(10)
+top
+```
+
+```{pyodide}
+#| label: explore-archaeology
+#| autorun: false
+# Archaeological cave sites grouped by broader context
+import pandas as pd
+arch = df[df["isArch"]].copy()
+print(f"Archaeological caves: {len(arch)}")
+print(f"  with Wikidata link: {(arch['wikidata'] != '').sum()}")
+print(f"  UNESCO World Heritage: {arch['isUnesco'].sum()}")
+print()
+print("Categories:")
+print(arch["archCategory"].value_counts().to_string())
+```
+
+```{pyodide}
+#| label: explore-custom
+#| autorun: false
+# Hier anpassen: filter or aggregate the DataFrame yourself
+# Example — caves within Europe (bounding box)
+europe = df[(df["lat"].between(35, 71)) & (df["lon"].between(-10, 40))]
+print(f"European caves: {len(europe)}  "
+      f"({len(europe)/len(df):.0%} of the catalogue)")
+```
+
+---
+
+*Part of an Open Educational Resource series on knowledge graphs and
+linked open data, produced in the context of
+[NFDI4Objects](https://www.nfdi4objects.net/). Data source:
+[Kaushal et al. 2024, SISALv3](https://doi.org/10.5194/essd-16-1933-2024);
+RDF conversion: [Research-Squirrel-Engineers/GeoScience-FAIRification-LOD](https://github.com/Research-Squirrel-Engineers/GeoScience-FAIRification-LOD).*

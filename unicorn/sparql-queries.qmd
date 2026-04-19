@@ -1,3 +1,11 @@
+# Install the SPARQLing Unicorn QGIS Plugin
+
+![](unicorn_qgis_marketplace.png)
+
+![](unicorn_qgis_install_1.png)
+
+![](unicorn_qgis_install_2.png)
+
 # Queries
 
 This page collects example SPARQL queries for the SPARQLing Unicorn

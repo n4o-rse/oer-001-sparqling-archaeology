@@ -3,9 +3,12 @@ project:
   output-dir: _site
   resources:
     - notebooks_amt/PotterAttributionExample.ttl
-    - notebooks_amt/amt-python.ipynb
-    - img/CC_SemanticLOD_Logo.png
-    - unicorn/unicorn_arno_sites.png
+    - notebooks_lod/campanian-ignimbrite_sites.ttl
+    - notebooks_lod/sisal_sites.ttl
+    - notebooks_lod/sisal_145_corchia_data.ttl
+    - unicorn/unicorn_qgis_marketplace.png
+    - unicorn/unicorn_qgis_install_1.png
+    - unicorn/unicorn_qgis_install_2.png
 
 website:
   title: "SPARQLing Archaeology"
@@ -41,6 +44,10 @@ website:
             href: notebooks_lod/n4okg-poseidon-country-capture-live.qmd
           - text: "Local TTL-File Campanian Ignimbrite Sites"
             href: notebooks_lod/local_ttl-campanian-ignimbrite-sites-live.qmd
+          - text: "Local TTL-File SISAL Sites"
+            href: notebooks_lod/local_ttl-sisal-sites-live.qmd
+          - text: "Local TTL-File SISAL Corchia"
+            href: notebooks_lod/local_ttl-sisal-corchia-live.qmd
       - text: "Jupyter Notebooks: AMT"
         menu:
           - text: "Academic Meta Tool - Potter Attribution Example"

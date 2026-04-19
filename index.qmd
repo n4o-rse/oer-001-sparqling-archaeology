@@ -129,7 +129,17 @@ The [SPARQLing Unicorn QGIS Plugin](https://github.com/sparqlunicorn/sparqlunico
 
 - [QGIS Plugin: SPARQL query examples](unicorn/sparql-queries.qmd) — a curated set of queries for use with the plugin.
 
-![](unicorn/unicorn_arno_sites.png){width=480 fig-alt="Screenshot of the SPARQLing Unicorn QGIS Plugin showing archaeological sites"}
+#### Install the SPARQLing Unicorn QGIS Plugin
+
+![](unicorn/unicorn_qgis_marketplace.png){width=480}
+
+![](unicorn/unicorn_qgis_install_1.png){width=480}
+
+![](unicorn/unicorn_qgis_install_2.png){width=480}
+
+#### Query Triplestores
+
+![](unicorn/unicorn_wikidata_holywells.png){width=480 fig-alt="Screenshot of the SPARQLing Unicorn QGIS Plugin showing archaeological sites"}
 
 ## Literature
 
